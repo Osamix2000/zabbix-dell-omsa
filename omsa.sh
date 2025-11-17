@@ -251,6 +251,69 @@ echo "$IDRACVERSION"
 
 }
 
+function PowerDiscovery {
+
+	OUT="$($OMSABIN chassis pwrmonitoring 2>/dev/null)"
+
+	# 非対応メッセージが出ている場合、空のLLDを返して終了
+	if echo "$OUT" | grep -q "Power Consumption Information is not available"; then
+		echo -e "{"
+		echo -e "\"data\":[]"
+		echo -e "}"
+		return
+	fi
+
+	# Index/Probe Nameが1つも無い場合も空LLD
+	if ! echo "$OUT" | grep -q "^Index"; then
+		echo -e "{"
+		echo -e "\"data\":[]"
+		echo -e "}"
+		return
+	fi
+
+	# 対応している場合は全Index＋Probe NameをLLDとして返す
+	IFS=$'\n' read -r -d '' -a PWRS <<< "$(echo "$OUT" | grep "^Index\|^Probe Name" | cut -d':' -f2 | sed 's/^ //' | paste - -)"
+
+	for PWR in "${PWRS[@]}"
+	do
+		read -a PWR_SPLIT <<< "$PWR"
+
+		INDEX=${PWR_SPLIT[0]}
+		PROBE=${PWR_SPLIT[@]:1}
+
+		RESULT+=$(echo -e "\n{\n\"{#PWRINDEX}\": \"$INDEX\",\n\"{#PWRNAME}\": \"$PROBE\" \n},")
+	done
+
+	echo -e "{"
+	echo -e "\"data\":["
+
+	JSON=$(echo "$RESULT" | sed '$s/,$//')
+
+	echo "$JSON"
+	echo "]}"
+}
+
+function PowerStatus {
+
+	INDEX="$1"
+
+	OUT="$($OMSABIN chassis pwrmonitoring 2>/dev/null)"
+
+	STATUS="$(echo "$OUT" | awk -v IDX="$INDEX" '
+		/^Index/ {
+			# 行の最後のフィールドをIndexとして保持
+			cur_idx = $NF
+		}
+		/^Reading/ && $NF=="W" && cur_idx==IDX {
+			# Reading の行で、末尾が W かつ Index が一致した場合に数値を出力
+			print $(NF-1)
+			exit
+		}
+	')"
+
+	echo "$STATUS"
+}
+
 function HandleArgs {
 
 	case "$1" in
@@ -304,9 +367,14 @@ function HandleArgs {
 			;;
 		status)
 			SystemStatus
-			;;												
-		esac
-
+			;;		
+		pwrdiscovery)
+			PowerDiscovery
+			;;
+		pwrstatus)
+			PowerStatus $2
+			;;
+	esac
 }
 
 HandleArgs $@

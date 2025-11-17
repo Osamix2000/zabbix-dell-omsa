@@ -1,0 +1,399 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<zabbix_export>
+    <version>7.0</version>
+    <template_groups>
+        <template_group>
+            <uuid>7df96b18c230490a9a0a9e2307226338</uuid>
+            <name>Templates</name>
+        </template_group>
+        <template_group>
+            <uuid>3dcd5bbe90534f9e8eb5c2d53756af63</uuid>
+            <name>Templates/Power</name>
+        </template_group>
+        <template_group>
+            <uuid>e960332b3f6c46a1956486d4f3f99fce</uuid>
+            <name>Templates/Server hardware</name>
+        </template_group>
+    </template_groups>
+    <templates>
+        <template>
+            <uuid>d9636ebd505f4ae89bcbd78c5bd16a7a</uuid>
+            <template>Template OMSA</template>
+            <name>Template Dell OMSA</name>
+            <description>ソース
+https://github.com/ronivay/zabbix-dell-omsa</description>
+            <groups>
+                <group>
+                    <name>Templates</name>
+                </group>
+                <group>
+                    <name>Templates/Power</name>
+                </group>
+                <group>
+                    <name>Templates/Server hardware</name>
+                </group>
+            </groups>
+            <items>
+                <item>
+                    <uuid>34bc3fc84eb345fca8bf335ec59da0c5</uuid>
+                    <name>システムBIOSバージョン</name>
+                    <key>omsa.bios</key>
+                    <delay>86400s</delay>
+                    <history>90d</history>
+                    <value_type>TEXT</value_type>
+                    <trends>0</trends>
+                    <tags>
+                        <tag>
+                            <tag>Application</tag>
+                            <value>OMSA: system information</value>
+                        </tag>
+                    </tags>
+                </item>
+                <item>
+                    <uuid>e231320c03164addb74ec923c30afe2e</uuid>
+                    <name>システムiDRACバージョン</name>
+                    <key>omsa.idrac</key>
+                    <delay>86400s</delay>
+                    <history>90d</history>
+                    <value_type>TEXT</value_type>
+                    <trends>0</trends>
+                    <tags>
+                        <tag>
+                            <tag>Application</tag>
+                            <value>OMSA: system information</value>
+                        </tag>
+                    </tags>
+                </item>
+                <item>
+                    <uuid>c8efac9166414abab0142b4c3f249370</uuid>
+                    <name>システムモデル</name>
+                    <key>omsa.model</key>
+                    <delay>86400</delay>
+                    <history>90d</history>
+                    <value_type>TEXT</value_type>
+                    <trends>0</trends>
+                    <tags>
+                        <tag>
+                            <tag>Application</tag>
+                            <value>OMSA: system information</value>
+                        </tag>
+                    </tags>
+                </item>
+                <item>
+                    <uuid>d6bb8db4b51040c480d1ee49305e9199</uuid>
+                    <name>システムサービスタグ</name>
+                    <key>omsa.stag</key>
+                    <delay>86400</delay>
+                    <history>90d</history>
+                    <value_type>TEXT</value_type>
+                    <trends>0</trends>
+                    <tags>
+                        <tag>
+                            <tag>Application</tag>
+                            <value>OMSA: system information</value>
+                        </tag>
+                    </tags>
+                </item>
+                <item>
+                    <uuid>c4b37e6b4a0a4a88b022ffd2fd438889</uuid>
+                    <name>システムヘルス</name>
+                    <key>omsa.status</key>
+                    <delay>86400s</delay>
+                    <history>90d</history>
+                    <value_type>TEXT</value_type>
+                    <trends>0</trends>
+                    <tags>
+                        <tag>
+                            <tag>Application</tag>
+                            <value>OMSA: system information</value>
+                        </tag>
+                    </tags>
+                </item>
+            </items>
+            <discovery_rules>
+                <discovery_rule>
+                    <uuid>593512caa428476fa2ac6dcb5bb09d13</uuid>
+                    <name>ファン探索</name>
+                    <key>omsa.fandiscovery</key>
+                    <delay>1800s</delay>
+                    <lifetime>30d</lifetime>
+                    <enabled_lifetime_type>DISABLE_NEVER</enabled_lifetime_type>
+                    <description>原文「Fan Discovery」</description>
+                    <item_prototypes>
+                        <item_prototype>
+                            <uuid>c1dbc8c1e27e4f7f91304dbee4d8ce06</uuid>
+                            <name>ファン: {#FAN} RPM</name>
+                            <key>omsa.fanstatus[{#FAN},rpm]</key>
+                            <delay>300s</delay>
+                            <history>90d</history>
+                            <units>rpm</units>
+                            <tags>
+                                <tag>
+                                    <tag>Application</tag>
+                                    <value>OMSA: fans</value>
+                                </tag>
+                            </tags>
+                        </item_prototype>
+                        <item_prototype>
+                            <uuid>83bb990e8695452e9cafdb4b672b5a13</uuid>
+                            <name>ファン: {#FAN} ステータス</name>
+                            <key>omsa.fanstatus[{#FAN},status]</key>
+                            <delay>1800s</delay>
+                            <history>90d</history>
+                            <value_type>TEXT</value_type>
+                            <trends>0</trends>
+                            <tags>
+                                <tag>
+                                    <tag>Application</tag>
+                                    <value>OMSA: fans</value>
+                                </tag>
+                            </tags>
+                            <trigger_prototypes>
+                                <trigger_prototype>
+                                    <uuid>0c6af199c90d41af9ab940963e5ce15f</uuid>
+                                    <expression>find(/Template OMSA/omsa.fanstatus[{#FAN},status],#1,&quot;iregexp&quot;,&quot;Ok&quot;)=0</expression>
+                                    <name>ファン {#FAN} 要確認</name>
+                                    <priority>WARNING</priority>
+                                    <description>該当するファンを確認してください。
+故障によって動作していないか、元から付いていない可能性があります。
+温度が高くない場合は無視してOKです。</description>
+                                    <manual_close>YES</manual_close>
+                                </trigger_prototype>
+                            </trigger_prototypes>
+                        </item_prototype>
+                    </item_prototypes>
+                </discovery_rule>
+                <discovery_rule>
+                    <uuid>03e2805c6b094bbf9174502815a58909</uuid>
+                    <name>物理ディスクの検出</name>
+                    <key>omsa.pddiscovery</key>
+                    <delay>1800s</delay>
+                    <lifetime>30d</lifetime>
+                    <enabled_lifetime_type>DISABLE_NEVER</enabled_lifetime_type>
+                    <description>原文「Physical Disk Discovery」</description>
+                    <item_prototypes>
+                        <item_prototype>
+                            <uuid>19da8584b60042ac812efc6397b64d7c</uuid>
+                            <name>物理ディスク: {#PDISK}の予測故障ステータス</name>
+                            <key>omsa.pdstatus[{#PDISK},{#CONTROLLER},pfailure]</key>
+                            <delay>1800s</delay>
+                            <history>90d</history>
+                            <value_type>TEXT</value_type>
+                            <trends>0</trends>
+                            <tags>
+                                <tag>
+                                    <tag>Application</tag>
+                                    <value>OMSA: physical disks controller {#CONTROLLER}</value>
+                                </tag>
+                            </tags>
+                            <trigger_prototypes>
+                                <trigger_prototype>
+                                    <uuid>619bc42d3cd54193b81846128368bad4</uuid>
+                                    <expression>find(/Template OMSA/omsa.pdstatus[{#PDISK},{#CONTROLLER},pfailure],#1,&quot;iregexp&quot;,&quot;No&quot;)=0</expression>
+                                    <name>物理ディスク: {#PDISK}の予測故障</name>
+                                    <priority>AVERAGE</priority>
+                                    <description>ディスクの状態がよろしくないかもしれません。
+smartctlやOMSA等で確認し、故障する前に交換を検討してください。</description>
+                                    <manual_close>YES</manual_close>
+                                </trigger_prototype>
+                            </trigger_prototypes>
+                        </item_prototype>
+                        <item_prototype>
+                            <uuid>20698060d1a04c658511ba6004d7d986</uuid>
+                            <name>物理ディスク: {#PDISK}のステータス</name>
+                            <key>omsa.pdstatus[{#PDISK},{#CONTROLLER},status]</key>
+                            <delay>1800s</delay>
+                            <history>90d</history>
+                            <value_type>TEXT</value_type>
+                            <trends>0</trends>
+                            <description>原文「Physical disk {#PDISK} status」</description>
+                            <tags>
+                                <tag>
+                                    <tag>Application</tag>
+                                    <value>OMSA: physical disks controller {#CONTROLLER}</value>
+                                </tag>
+                            </tags>
+                            <trigger_prototypes>
+                                <trigger_prototype>
+                                    <uuid>9f5aad22e6554cda94b59af375bc133c</uuid>
+                                    <expression>find(/Template OMSA/omsa.pdstatus[{#PDISK},{#CONTROLLER},status],#1,&quot;iregexp&quot;,&quot;Online|Ready&quot;)=0</expression>
+                                    <name>物理ディスク: {#PDISK}が故障しました</name>
+                                    <priority>HIGH</priority>
+                                    <description>smartctlまたはOMSAでディスクの状態を確認してください。
+実際に故障していた場合は、ディスクを購入し交換して冗長性を保つようにしてください。</description>
+                                    <manual_close>YES</manual_close>
+                                </trigger_prototype>
+                            </trigger_prototypes>
+                        </item_prototype>
+                    </item_prototypes>
+                </discovery_rule>
+                <discovery_rule>
+                    <uuid>2aea2607d4f54b3894c0bfe50562aadf</uuid>
+                    <name>電源ユニットの検出</name>
+                    <key>omsa.psudiscovery</key>
+                    <delay>1800s</delay>
+                    <lifetime>30d</lifetime>
+                    <enabled_lifetime_type>DISABLE_NEVER</enabled_lifetime_type>
+                    <item_prototypes>
+                        <item_prototype>
+                            <uuid>3a747710b3d54e97a8fd8dd2355cad62</uuid>
+                            <name>PSU: {#PSU}のステータス</name>
+                            <key>omsa.psustatus[{#PSU}]</key>
+                            <delay>1800s</delay>
+                            <history>90d</history>
+                            <value_type>TEXT</value_type>
+                            <trends>0</trends>
+                            <tags>
+                                <tag>
+                                    <tag>Application</tag>
+                                    <value>OMSA: power supplies</value>
+                                </tag>
+                            </tags>
+                            <trigger_prototypes>
+                                <trigger_prototype>
+                                    <uuid>1643d9f260f742549c001c3da6dad645</uuid>
+                                    <expression>find(/Template OMSA/omsa.psustatus[{#PSU}],#1,&quot;iregexp&quot;,&quot;Ok&quot;)=0</expression>
+                                    <name>PSU: {#PSU}が未使用または故障しています</name>
+                                    <priority>WARNING</priority>
+                                    <description>電源ケーブルを繋いでいない場合は無視してください。
+2本電源ケーブルを接続しているのにも関わらず通知が来る場合は、片方電源ユニットが故障している可能性があります。</description>
+                                    <manual_close>YES</manual_close>
+                                </trigger_prototype>
+                            </trigger_prototypes>
+                        </item_prototype>
+                    </item_prototypes>
+                </discovery_rule>
+                <discovery_rule>
+                    <uuid>5c8725dafaae4c01aec7cd33e5b3b15b</uuid>
+                    <name>メモリの検出</name>
+                    <key>omsa.ramdiscovery</key>
+                    <delay>1800s</delay>
+                    <lifetime>30d</lifetime>
+                    <enabled_lifetime_type>DISABLE_NEVER</enabled_lifetime_type>
+                    <description>原文「RAM discovery」</description>
+                    <item_prototypes>
+                        <item_prototype>
+                            <uuid>b3dd131d207c4fcea03072b3948e31dc</uuid>
+                            <name>メモリステータス: {#RAM}</name>
+                            <key>omsa.ramstatus[{#RAM}]</key>
+                            <delay>1800s</delay>
+                            <history>90d</history>
+                            <value_type>TEXT</value_type>
+                            <trends>0</trends>
+                            <tags>
+                                <tag>
+                                    <tag>Application</tag>
+                                    <value>OMSA: RAM</value>
+                                </tag>
+                            </tags>
+                            <trigger_prototypes>
+                                <trigger_prototype>
+                                    <uuid>1ec5f4030ce5488fab45d1fcddccd2d7</uuid>
+                                    <expression>find(/Template OMSA/omsa.ramstatus[{#RAM}],#1,&quot;iregexp&quot;,&quot;Ok&quot;)=0</expression>
+                                    <name>メモリ: {#RAM}が正常では無い可能性があります</name>
+                                    <priority>AVERAGE</priority>
+                                </trigger_prototype>
+                            </trigger_prototypes>
+                        </item_prototype>
+                    </item_prototypes>
+                </discovery_rule>
+                <discovery_rule>
+                    <uuid>21a4b144cd884f19b7b78eef8ed2a7d4</uuid>
+                    <name>温度の検出</name>
+                    <key>omsa.tempdiscovery</key>
+                    <delay>1800s</delay>
+                    <lifetime>30d</lifetime>
+                    <enabled_lifetime_type>DISABLE_NEVER</enabled_lifetime_type>
+                    <item_prototypes>
+                        <item_prototype>
+                            <uuid>2783f8e2df784a40a3cfa59a9d0acb0e</uuid>
+                            <name>{#TEMP}</name>
+                            <key>omsa.tempstatus[{#TEMPINDEX}]</key>
+                            <delay>300s</delay>
+                            <history>90d</history>
+                            <value_type>FLOAT</value_type>
+                            <units>C</units>
+                            <tags>
+                                <tag>
+                                    <tag>Application</tag>
+                                    <value>OMSA: temperatures</value>
+                                </tag>
+                            </tags>
+                        </item_prototype>
+                    </item_prototypes>
+                </discovery_rule>
+                <discovery_rule>
+                    <uuid>f33ed4feb29247dd89351f1583497ef8</uuid>
+                    <name>仮想ディスクの検出</name>
+                    <key>omsa.vddiscovery</key>
+                    <delay>1800s</delay>
+                    <lifetime>30d</lifetime>
+                    <enabled_lifetime_type>DISABLE_NEVER</enabled_lifetime_type>
+                    <item_prototypes>
+                        <item_prototype>
+                            <uuid>b6864acc72164a95a93826df22e9772b</uuid>
+                            <name>仮想ディスク: {#VDISK}のRAIDタイプ</name>
+                            <key>omsa.vdstatus[{#VDISK},{#CONTROLLER},raid]</key>
+                            <delay>7200s</delay>
+                            <history>90d</history>
+                            <value_type>TEXT</value_type>
+                            <trends>0</trends>
+                            <tags>
+                                <tag>
+                                    <tag>Application</tag>
+                                    <value>OMSA: virtual disks controller {#CONTROLLER}</value>
+                                </tag>
+                            </tags>
+                        </item_prototype>
+                        <item_prototype>
+                            <uuid>823c532d38524c3c8c96ebc4a21cfeba</uuid>
+                            <name>仮想ディスク: {#VDISK}サイズ</name>
+                            <key>omsa.vdstatus[{#VDISK},{#CONTROLLER},size]</key>
+                            <delay>7200s</delay>
+                            <history>90d</history>
+                            <units>B</units>
+                            <tags>
+                                <tag>
+                                    <tag>Application</tag>
+                                    <value>OMSA: virtual disks controller {#CONTROLLER}</value>
+                                </tag>
+                            </tags>
+                        </item_prototype>
+                        <item_prototype>
+                            <uuid>dd7d49e2fce74c0699772594b375649c</uuid>
+                            <name>仮想ディスク: {#VDISK}ステータス</name>
+                            <key>omsa.vdstatus[{#VDISK},{#CONTROLLER},status]</key>
+                            <delay>1800s</delay>
+                            <history>90d</history>
+                            <value_type>TEXT</value_type>
+                            <trends>0</trends>
+                            <tags>
+                                <tag>
+                                    <tag>Application</tag>
+                                    <value>OMSA: virtual disks controller {#CONTROLLER}</value>
+                                </tag>
+                            </tags>
+                            <trigger_prototypes>
+                                <trigger_prototype>
+                                    <uuid>83e20028bcf04acdbafa557d81efc21c</uuid>
+                                    <expression>find(/Template OMSA/omsa.vdstatus[{#VDISK},{#CONTROLLER},status],#1,&quot;iregexp&quot;,&quot;Ok&quot;)=0</expression>
+                                    <name>仮想ディスク: {#VDISK}を確認してください</name>
+                                    <priority>AVERAGE</priority>
+                                    <description>ストレージの破損でRAIDが崩壊した可能性があります。
+もし誤検知である場合は手動でクローズしてください。</description>
+                                    <manual_close>YES</manual_close>
+                                </trigger_prototype>
+                            </trigger_prototypes>
+                        </item_prototype>
+                    </item_prototypes>
+                </discovery_rule>
+            </discovery_rules>
+            <macros>
+                <macro>
+                    <macro>{$CONTROLLER}</macro>
+                    <value>{#CONTROLLER}</value>
+                </macro>
+            </macros>
+        </template>
+    </templates>
+</zabbix_export>
