@@ -35,12 +35,138 @@ https://github.com/ronivay/zabbix-dell-omsa</description>
             </groups>
             <items>
                 <item>
+                    <uuid>ee45fb238a93480f91228217f7d7908c</uuid>
+                    <name>CMOSバッテリー全体の健康状態</name>
+                    <key>omsa.battstatus[0,health]</key>
+                    <delay>1h</delay>
+                    <value_type>CHAR</value_type>
+                    <trends>0</trends>
+                    <tags>
+                        <tag>
+                            <tag>Application</tag>
+                            <value>OMSA: system information</value>
+                        </tag>
+                    </tags>
+                </item>
+                <item>
                     <uuid>34bc3fc84eb345fca8bf335ec59da0c5</uuid>
                     <name>システムBIOSバージョン</name>
                     <key>omsa.bios</key>
                     <delay>86400s</delay>
                     <history>90d</history>
                     <value_type>TEXT</value_type>
+                    <trends>0</trends>
+                    <tags>
+                        <tag>
+                            <tag>Application</tag>
+                            <value>OMSA: system information</value>
+                        </tag>
+                    </tags>
+                </item>
+                <item>
+                    <uuid>58ed221df49148049c467ef8c6270be8</uuid>
+                    <name>iDRACライセンス</name>
+                    <key>omsa.bmc[device_type]</key>
+                    <delay>60m</delay>
+                    <value_type>CHAR</value_type>
+                    <trends>0</trends>
+                    <inventory_link>SOFTWARE</inventory_link>
+                    <tags>
+                        <tag>
+                            <tag>Application</tag>
+                            <value>OMSA: system information</value>
+                        </tag>
+                    </tags>
+                </item>
+                <item>
+                    <uuid>0c26e6f7d0d1424a82ee413643304f2b</uuid>
+                    <name>IPMI Over LAN有効状態</name>
+                    <key>omsa.bmc[ipmi_over_lan]</key>
+                    <delay>3m</delay>
+                    <value_type>CHAR</value_type>
+                    <trends>0</trends>
+                    <tags>
+                        <tag>
+                            <tag>Application</tag>
+                            <value>OMSA: system information</value>
+                        </tag>
+                    </tags>
+                </item>
+                <item>
+                    <uuid>af225e88482043849b641f2d010fb1e9</uuid>
+                    <name>IPMIバージョン</name>
+                    <key>omsa.bmc[ipmi_version]</key>
+                    <delay>5m</delay>
+                    <value_type>CHAR</value_type>
+                    <trends>0</trends>
+                    <tags>
+                        <tag>
+                            <tag>Application</tag>
+                            <value>OMSA: system information</value>
+                        </tag>
+                    </tags>
+                </item>
+                <item>
+                    <uuid>7c7d395951d540e3bfaba8e99fd8a506</uuid>
+                    <name>iDRAC IPv4アドレス</name>
+                    <key>omsa.bmc[ipv4]</key>
+                    <delay>3m</delay>
+                    <value_type>CHAR</value_type>
+                    <trends>0</trends>
+                    <tags>
+                        <tag>
+                            <tag>Application</tag>
+                            <value>OMSA: system information</value>
+                        </tag>
+                    </tags>
+                </item>
+                <item>
+                    <uuid>79c06f4dda254a3e98510ab115b4b4bc</uuid>
+                    <name>iDRAC MACアドレス</name>
+                    <key>omsa.bmc[mac]</key>
+                    <delay>1440m</delay>
+                    <value_type>CHAR</value_type>
+                    <trends>0</trends>
+                    <tags>
+                        <tag>
+                            <tag>Application</tag>
+                            <value>OMSA: system information</value>
+                        </tag>
+                    </tags>
+                </item>
+                <item>
+                    <uuid>1ef029d9936b4c5c806d6715e9b41963</uuid>
+                    <name>iDRACアクティブセッション数</name>
+                    <key>omsa.bmc[sessions_active]</key>
+                    <value_type>CHAR</value_type>
+                    <trends>0</trends>
+                    <tags>
+                        <tag>
+                            <tag>Application</tag>
+                            <value>OMSA: system information</value>
+                        </tag>
+                    </tags>
+                </item>
+                <item>
+                    <uuid>16c7e9071bac4949b0a232dca77544e6</uuid>
+                    <name>iDRAC最大セッション数</name>
+                    <key>omsa.bmc[sessions_possible]</key>
+                    <delay>1440m</delay>
+                    <value_type>CHAR</value_type>
+                    <trends>0</trends>
+                    <tags>
+                        <tag>
+                            <tag>Application</tag>
+                            <value>OMSA: system information</value>
+                        </tag>
+                    </tags>
+                </item>
+                <item>
+                    <uuid>69b0c2c899c741a0b1ef037fabd0e74e</uuid>
+                    <name>SOL有効状態</name>
+                    <key>omsa.bmc[sol_enabled]</key>
+                    <delay>3m</delay>
+                    <value_type>CHAR</value_type>
                     <trends>0</trends>
                     <tags>
                         <tag>
@@ -57,6 +183,7 @@ https://github.com/ronivay/zabbix-dell-omsa</description>
                     <history>90d</history>
                     <value_type>TEXT</value_type>
                     <trends>0</trends>
+                    <inventory_link>SOFTWARE_FULL</inventory_link>
                     <tags>
                         <tag>
                             <tag>Application</tag>
@@ -72,6 +199,7 @@ https://github.com/ronivay/zabbix-dell-omsa</description>
                     <history>90d</history>
                     <value_type>TEXT</value_type>
                     <trends>0</trends>
+                    <inventory_link>MODEL</inventory_link>
                     <tags>
                         <tag>
                             <tag>Application</tag>
@@ -87,6 +215,7 @@ https://github.com/ronivay/zabbix-dell-omsa</description>
                     <history>90d</history>
                     <value_type>TEXT</value_type>
                     <trends>0</trends>
+                    <inventory_link>TAG</inventory_link>
                     <tags>
                         <tag>
                             <tag>Application</tag>
@@ -111,6 +240,42 @@ https://github.com/ronivay/zabbix-dell-omsa</description>
                 </item>
             </items>
             <discovery_rules>
+                <discovery_rule>
+                    <uuid>688bd1ea51e0460c871bee705941d0ac</uuid>
+                    <name>CMOSバッテリー監視ディスカバリ</name>
+                    <key>omsa.battdiscovery</key>
+                    <delay>1h</delay>
+                    <item_prototypes>
+                        <item_prototype>
+                            <uuid>c8a7205addbe4fc8bead60ee9cc8d619</uuid>
+                            <name>CMOSバッテリー劣化判定 [{#BATTPROBE}]</name>
+                            <key>omsa.battstatus[{#BATTINDEX},reading]</key>
+                            <delay>5m</delay>
+                            <value_type>CHAR</value_type>
+                            <trends>0</trends>
+                            <tags>
+                                <tag>
+                                    <tag>Application</tag>
+                                    <value>OMSA: system information</value>
+                                </tag>
+                            </tags>
+                        </item_prototype>
+                        <item_prototype>
+                            <uuid>1c0881cfd17e4d2a8df4c24b7e77adde</uuid>
+                            <name>CMOSバッテリー状態 [{#BATTPROBE}]</name>
+                            <key>omsa.battstatus[{#BATTINDEX},status]</key>
+                            <delay>5m</delay>
+                            <value_type>CHAR</value_type>
+                            <trends>0</trends>
+                            <tags>
+                                <tag>
+                                    <tag>Application</tag>
+                                    <value>OMSA: system information</value>
+                                </tag>
+                            </tags>
+                        </item_prototype>
+                    </item_prototypes>
+                </discovery_rule>
                 <discovery_rule>
                     <uuid>593512caa428476fa2ac6dcb5bb09d13</uuid>
                     <name>ファン探索</name>
@@ -232,6 +397,7 @@ smartctlやOMSA等で確認し、故障する前に交換を検討してくだ�
                     <name>電源ユニットの検出</name>
                     <key>omsa.psudiscovery</key>
                     <delay>1800s</delay>
+                    <status>DISABLED</status>
                     <lifetime>30d</lifetime>
                     <enabled_lifetime_type>DISABLE_NEVER</enabled_lifetime_type>
                     <item_prototypes>
@@ -260,6 +426,27 @@ smartctlやOMSA等で確認し、故障する前に交換を検討してくだ�
                                     <manual_close>YES</manual_close>
                                 </trigger_prototype>
                             </trigger_prototypes>
+                        </item_prototype>
+                    </item_prototypes>
+                </discovery_rule>
+                <discovery_rule>
+                    <uuid>f52a8de04b5b4b7481dd3ae51266ac2b</uuid>
+                    <name>電力監視ディスカバリ</name>
+                    <key>omsa.pwrdiscovery</key>
+                    <lifetime>14d</lifetime>
+                    <item_prototypes>
+                        <item_prototype>
+                            <uuid>e81d9d790277498c892c0bd908a6ebbf</uuid>
+                            <name>{#PWRNAME}の消費電力</name>
+                            <key>omsa.pwrstatus[{#PWRINDEX}]</key>
+                            <history>90d</history>
+                            <units>W</units>
+                            <tags>
+                                <tag>
+                                    <tag>Application</tag>
+                                    <value>OMSA: power consumption</value>
+                                </tag>
+                            </tags>
                         </item_prototype>
                     </item_prototypes>
                 </discovery_rule>
@@ -388,6 +575,12 @@ smartctlやOMSA等で確認し、故障する前に交換を検討してくだ�
                     </item_prototypes>
                 </discovery_rule>
             </discovery_rules>
+            <tags>
+                <tag>
+                    <tag>Application</tag>
+                    <value>OMSA</value>
+                </tag>
+            </tags>
             <macros>
                 <macro>
                     <macro>{$CONTROLLER}</macro>

@@ -87,7 +87,6 @@ esac
 
 }
 
-
 function FanDiscovery {
 
 IFS=$'\n' read -r -d '' -a FANS <<< "$($OMSABIN chassis fans | grep ^Index | awk '{print $3}')"
@@ -314,8 +313,235 @@ function PowerStatus {
 	echo "$STATUS"
 }
 
-function HandleArgs {
+function BmcInfo {
 
+	MODE="$1"
+
+	OUT="$($OMSABIN chassis bmc 2>/dev/null)"
+
+	# BMC/iDRAC が無い、または取得できない場合は何も返さず終了
+	if [ -z "$OUT" ] || ! echo "$OUT" | grep -q "Remote Access Device"; then
+		exit 0
+	fi
+
+	case "$MODE" in
+		device_type)
+			echo "$OUT" | awk -F':' '/Device Type/ { gsub(/^ *| *$/,"",$2); print $2; exit }'
+			;;
+		ipmi_version)
+			echo "$OUT" | awk -F':' '/IPMI Version/ { gsub(/^ *| *$/,"",$2); print $2; exit }'
+			;;
+		sessions_possible)
+			echo "$OUT" | awk -F':' '/Number of Possible Active Sessions/ { gsub(/^ *| *$/,"",$2); print $2; exit }'
+			;;
+		sessions_active)
+			echo "$OUT" | awk -F':' '/Number of Current Active Sessions/ { gsub(/^ *| *$/,"",$2); print $2; exit }'
+			;;
+		ipmi_over_lan)
+			echo "$OUT" | awk -F':' '/Enable IPMI Over LAN/ { gsub(/^ *| *$/,"",$2); print $2; exit }'
+			;;
+		sol_enabled)
+			echo "$OUT" | awk -F':' '/SOL Enabled/ { gsub(/^ *| *$/,"",$2); print $2; exit }'
+			;;
+		mac)
+			echo "$OUT" | awk -F':' '/MAC Address/ { gsub(/^ *| *$/,"",$2); print $2; exit }'
+			;;
+		ipv4)
+			echo "$OUT" | awk '
+				/^IPv4 Address/ { in_block=1; next }
+				in_block && NF==0 { in_block=0; next }
+				in_block && $0 ~ /IP Address[[:space:]]*:/ {
+					sub(/.*IP Address[[:space:]]*:[[:space:]]*/, "", $0);
+					gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0);
+					print $0;
+					exit
+				}
+			'
+			;;
+		ipv4_source)
+			echo "$OUT" | awk -v RS="" '
+				/IPv4 Address/ {
+					while (getline line) {
+						if (line ~ /^IPv6 Address/) break
+						if (line ~ /IP Address Source[[:space:]]*:/) {
+							n = split(line, a, ":")
+							if (n > 1) {
+								gsub(/^ *| *$/, "", a[2])
+								print a[2]
+								exit
+							}
+						}
+					}
+				}
+			'
+			;;
+		ipv4_subnet)
+			echo "$OUT" | awk -v RS="" '
+				/IPv4 Address/ {
+					while (getline line) {
+						if (line ~ /^IPv6 Address/) break
+						if (line ~ /IP Subnet[[:space:]]*:/) {
+							n = split(line, a, ":")
+							if (n > 1) {
+								gsub(/^ *| *$/, "", a[2])
+								print a[2]
+								exit
+							}
+						}
+					}
+				}
+			'
+			;;
+		ipv4_gateway)
+			echo "$OUT" | awk -v RS="" '
+				/IPv4 Address/ {
+					while (getline line) {
+						if (line ~ /^IPv6 Address/) break
+						if (line ~ /IP Gateway[[:space:]]*:/) {
+							n = split(line, a, ":")
+							if (n > 1) {
+								gsub(/^ *| *$/, "", a[2])
+								print a[2]
+								exit
+							}
+						}
+					}
+				}
+			'
+			;;
+	esac
+}
+
+function CmosBatteryStatus {
+	OUT="$($OMSABIN chassis batteries 2>/dev/null)"
+
+	# 出力が無い、または"Batteries"セクションが無ければ何も返さず終了
+	if [ -z "$OUT" ] || ! echo "$OUT" | grep -q "^Batteries"; then
+		exit 0
+	fi
+
+	STATUS="$(echo "$OUT" | awk '
+		/^Index/ { idx=$3 }
+		/^Probe Name[[:space:]]*:[[:space:]]*System Board CMOS Battery/ { target=idx }
+		/^Reading/ && target==idx { print $3; exit }
+	')"
+
+	# STATUS が空なら何も出さず終了
+	[ -z "$STATUS" ] && exit 0
+
+	echo "$STATUS"
+}
+
+function BatteriesDiscovery {
+	OUT="$($OMSABIN chassis batteries 2>/dev/null)"
+
+	# 出力が無い、または "Batteries" セクションが無い場合は空LLD
+	if [ -z "$OUT" ] || ! echo "$OUT" | grep -q "^Batteries"; then
+		echo -e "{"
+		echo -e "\"data\":[]"
+		echo -e "}"
+		return
+	fi
+
+	# Individual Battery Elements が無い場合も空LLD
+	if ! echo "$OUT" | grep -q "^Individual Battery Elements"; then
+		echo -e "{"
+		echo -e "\"data\":[]"
+		echo -e "}"
+		return
+	fi
+
+	RESULT=""
+	in_section=0
+	CUR_INDEX=""
+
+	while IFS= read -r line; do
+
+		# 個別バッテリー要素セクション開始
+		if echo "$line" | grep -q "^Individual Battery Elements"; then
+			in_section=1
+			continue
+		fi
+
+		# セクション外は無視
+		[ "$in_section" -eq 1 ] || continue
+
+		# Index行
+		if echo "$line" | grep -q "^Index"; then
+            # "Index      : 0" の3番目のフィールドを取る
+			CUR_INDEX=$(echo "$line" | awk '{print $3}')
+			continue
+		fi
+
+		# Probe Name行
+		if echo "$line" | grep -q "^Probe Name"; then
+            # コロン以降を取り、前後の空白を削る
+			PROBE=$(echo "$line" | cut -d':' -f2- | sed 's/^ *//;s/ *$//')
+			RESULT+=$(echo -e "\n{\n\"{#BATTINDEX}\": \"$CUR_INDEX\",\n\"{#BATTPROBE}\": \"$PROBE\" \n},")
+		fi
+
+	done <<< "$OUT"
+
+	echo -e "{"
+	echo -e "\"data\":["
+	JSON=$(echo "$RESULT" | sed '$s/,$//')
+	echo "$JSON"
+	echo "]}"
+}
+
+function BatteriesStatus {
+
+	INDEX="$1"
+	FIELD="$2"
+
+	OUT="$($OMSABIN chassis batteries 2>/dev/null)"
+
+	# 出力が無い場合
+	if [ -z "$OUT" ] || ! echo "$OUT" | grep -q "^Batteries"; then
+		exit 0
+	fi
+
+	# ▼ 全体Health
+	if [ "$FIELD" = "health" ]; then
+		echo "$OUT" | grep "^Health" | awk -F':' '{gsub(/^ *| *$/, "", $2); print $2}'
+		exit 0
+	fi
+
+	# ▼ 個別Indexの処理
+	CUR=""
+	FOUND=""
+
+	while IFS= read -r line; do
+
+		if echo "$line" | grep -q "^Index"; then
+			CUR=$(echo "$line" | awk '{print $3}')
+			continue
+		fi
+
+		# 対象Indexのみに絞る
+		if [ "$CUR" = "$INDEX" ]; then
+
+			if [ "$FIELD" = "status" ] && echo "$line" | grep -q "^Status[[:space:]]*:"; then
+				echo "$line" | awk -F':' '{gsub(/^ *| *$/, "", $2); print $2}'
+				exit 0
+			fi
+
+			if [ "$FIELD" = "reading" ] && echo "$line" | grep -q "^Reading[[:space:]]*:"; then
+				echo "$line" | awk -F':' '{gsub(/^ *| *$/, "", $2); print $2}'
+				exit 0
+			fi
+
+			if [ "$FIELD" = "probe" ] && echo "$line" | grep -q "^Probe Name[[:space:]]*:"; then
+				echo "$line" | awk -F':' '{gsub(/^ *| *$/, "", $2); print $2}'
+				exit 0
+			fi
+
+		fi
+
+	done <<< "$OUT"
+}
+
+function HandleArgs {
 	case "$1" in
 		pddiscovery)
 			PhysicalDisksDiscovery
@@ -373,6 +599,18 @@ function HandleArgs {
 			;;
 		pwrstatus)
 			PowerStatus $2
+			;;
+		bmc)
+			BmcInfo $2
+			;;
+		cmos)
+			CmosBatteryStatus
+			;;
+		battdiscovery)
+			BatteriesDiscovery
+			;;
+		battstatus)
+			BatteriesStatus $2 $3
 			;;
 	esac
 }
