@@ -1,91 +1,86 @@
-# Dell Omsa Zabbix monitoring
+# Dell OMSA Zabbix 監視
 
-This repository includes script, config and zabbix template for monitoring different components and information from a dell server running omsa on linux.
+このリポジトリには、Linux上でOMSAを実行しているDellサーバーのさまざまなコンポーネントや情報を監視するためのスクリプト・設定・Zabbixテンプレートが含まれています。
 
-Tested with:
-OMSA: 8.1.0
-Zabbix: 4.0.0
+テスト済みバージョン:  
+OMSA: 8.1.0  
+Zabbix: 7.0.21
 
-#### OMSA
+#### OMSA とは
 
-Dell OpenManage Server Administrator tools allows you to query and configure physical components on the server.
+Dell OpenManage Server Administrator (OMSA) は、サーバーの物理コンポーネントの状態取得や設定を行えるツールです。
 
 https://www.dell.com/support/article/yu/en/yudhs1/sln312492/openmanage-server-administrator-omsa?lang=en
 
-#### Zabbix
+#### Zabbix とは
 
-Zabbix is an open source monitoring solution
+Zabbix はオープンソースの監視ソリューションです。
 
 https://www.zabbix.com/
 
-#### What
+#### 本リポジトリについて
 
-Script and template in this repository will monitor the most important components and information from the server. It won't show every little detail provided by omsa. Below is a list of provided information:
+このリポジトリ内のスクリプトとテンプレートは、サーバーの最も重要なコンポーネントや情報を監視します。  
+OMSAが提供する全ての細かい情報を網羅するものではありません。  
+以下は取得可能な情報の一覧です。
 
-Discovered items:
-- Virtual disks and their controller
-- Physical disks and their controller
-- Fans with their index number
-- PSU's with their index number
-- Temperature sensors
-- RAM with their index number
+### 自動検出される項目 (Discovery)
 
-Monitored items and triggers:
-- Individual physical disks and their status
+- 仮想ディスクとそのコントローラ
+- 物理ディスクとそのコントローラ
+- ファン (インデックス番号付き)
+- 電源ユニット PSU (インデックス番号付き)
+- 温度センサー
+- RAMモジュール (インデックス番号付き)
+
+### 監視される項目とトリガー
+
+- 物理ディスクの状態  
   `Trigger: physical disk not online or predictive failure is true`
-- Individual virtual disk RAID type/size and status
+- 仮想ディスクのRAID種類/サイズ、ステータス  
   `Trigger: virtual disk status is not ok`
-- Individual fans and their status and RPM
+- ファンの状態・RPM  
   `Trigger: fan status not ok`
-- Individual PSU's and their status
+- PSUの状態  
   `Trigger: PSU status not ok`
-- Individual temperature sensors and their value
-- Individual RAM modules and their status
+- 温度センサーの値
+- RAMモジュールの状態  
   `Trigger: RAM status not ok`
-- Server model
-- Server service tag
-- Server BIOS version
-- Server iDRAC version
-- Server general health status
+- サーバーモデル
+- サーバーのサービスタグ
+- BIOSバージョン
+- iDRACバージョン
+- サーバー全体のヘルスステータス  
   `Trigger: if any of the status indicators is not ok`
 
-This is all based on what i find useful. If you think something important is missing, please make a pull request or suggestion to make it even better.
+#### インストール方法
 
-#### Installation
+1. まずDell OMSAをインストールします  
+   手順: http://linux.dell.com/repo/hardware/omsa.html
 
-- Start up by installing dell omsa if you don't have it already. Follow instructions in: http://linux.dell.com/repo/hardware/omsa.html
-
-- Clone this repository to your zabbix-agent path
+2. このリポジトリをZabbix Agentのパスにクローンします
 ```
 git clone https://github.com/ronivay/zabbix-dell-omsa /etc/zabbix/dell-omsa
 ```
-- Edit your zabbix agent configuration and add
+
+3. Zabbix Agent の設定を編集し以下を追加します
 ```
 Include=/etc/zabbix/dell-omsa/omsa.conf
 ```
-- Restart zabbix-agent
 
-- Add sudo permissions for zabbix-agent to run omsa.sh script
+4. Zabbix Agent を再起動
+
+5. zabbix ユーザーが omsa.sh をsudo無しで実行できるよう権限追加
 ```
 visudo
 
-add line:
+以下を追加:
 zabbix ALL=(ALL)  NOPASSWD: /etc/zabbix/dell-omsa/omsa.sh
 ```
-Zabbix agent part is now done, we can move to our zabbix-server
 
-* Download the `dell-omsa-template.xml` file from this repository to your local machine and open your zabbix-server WebUI.
-
-* Navigate to `configure` -> `templates` -> `import`
-
-* Choose the .xml file and hit import
-
-Now we should have a new template called `Template OMSA` which we can add to our host.
-
-Many of the items are checked once in 24hours since they are something that won't really change. Failing and changing items are checked more frequently, but not more often than 5minutes. Feel free to change these values if you wish.
+6. テンプレートxmlをZabbix Serverにインポートしてテンプレートを割り当てる。
 
 #### Tips
 
-omsa.sh script has a OMSABIN variable which points by default to `/opt/dell/srvadmin/bin/omreport`
-If for some reason your omsa installation is located somewhere else, you need to change this variable.
-
+`omsa.sh` 内の `OMSABIN` 変数はデフォルトで `/opt/dell/srvadmin/bin/omreport` を指しています。  
+環境によってOMSAが別ディレクトリにインストールされている場合は、この変数を変更してください。
