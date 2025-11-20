@@ -1,9 +1,9 @@
 # Dell OMSA Zabbix 監視
 
-このリポジトリには、Linux上でOMSAを実行しているDellサーバーのさまざまなコンポーネントや情報を監視するためのスクリプト・設定・Zabbixテンプレートが含まれています。
+このリポジトリには、Linux上でOMSAを実行しているDellサーバーの様々なコンポーネントや情報を監視する為のスクリプト・設定・Zabbixテンプレートが含まれています。
 
 テスト済みバージョン:  
-OMSA: 8.1.0  
+OMSA: 11.0.0.0
 Zabbix: 7.0.21
 
 #### OMSA とは
@@ -32,6 +32,7 @@ OMSAが提供する全ての細かい情報を網羅するものではありま�
 - 電源ユニット PSU (インデックス番号付き)
 - 温度センサー
 - RAMモジュール (インデックス番号付き)
+- CMOSバッテリー
 
 ### 監視される項目とトリガー
 
@@ -50,6 +51,7 @@ OMSAが提供する全ての細かい情報を網羅するものではありま�
 - サーバーのサービスタグ
 - BIOSバージョン
 - iDRACバージョン
+- iDRACライセンス
 - サーバー全体のヘルスステータス  
   `Trigger: if any of the status indicators is not ok`
 
@@ -58,27 +60,51 @@ OMSAが提供する全ての細かい情報を網羅するものではありま�
 1. まずDell OMSAをインストールします  
    手順: http://linux.dell.com/repo/hardware/omsa.html
 
-2. このリポジトリをZabbix Agentのパスにクローンします
+2. このリポジトリをクローンします
 ```
-git clone https://github.com/ronivay/zabbix-dell-omsa /etc/zabbix/dell-omsa
+https://github.com/Osamix2000/zabbix-dell-omsa.git
+```
+※後程xmlファイルをブラウザからインポートする為、作業しているPCにもクローンする事をおすすめします
+
+3. クローンしたフォルダに移動します
+```
+cd zabbix-dell-omsa
 ```
 
-3. Zabbix Agent の設定を編集し以下を追加します
+4. omsa.shとomsa.confを移動します
 ```
-Include=/etc/zabbix/dell-omsa/omsa.conf
+mkdir -p /home/zabbix/.sh
+mv omsa.sh /home/zabbix/.sh
+
+mv omsa.conf /etc/zabbix/zabbix_agentd.d
 ```
 
-4. Zabbix Agent を再起動
+5. omsa.shの権限と所有者を変更します
+```
+chmod +x /home/zabbix/.sh/omsa.sh
+chown -R zabbix:zabbix /home/zabbix
+```
 
-5. zabbix ユーザーが omsa.sh をsudo無しで実行できるよう権限追加
+6. Zabbix ユーザーが omsa.sh をsudo無しで実行できるよう権限追加
 ```
 visudo
 
 以下を追加:
-zabbix ALL=(ALL)  NOPASSWD: /etc/zabbix/dell-omsa/omsa.sh
+zabbix ALL=(ALL)  NOPASSWD: /home/zabbix/.sh/omsa.sh
 ```
 
-6. テンプレートxmlをZabbix Serverにインポートしてテンプレートを割り当てる。
+7. Zabbix Agentを再起動します
+```
+systemctl restart zabbix-agent
+```
+
+8. クローンしたフォルダを削除します
+```
+cd ../
+rm -rf zabbix-dell-omsa
+```
+
+9. `dell-omsa-template-ja.xml` をZabbix Serverにインポートしてテンプレートを割り当てます。
 
 #### Tips
 
