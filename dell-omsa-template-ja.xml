@@ -70,6 +70,8 @@ https://github.com/ronivay/zabbix-dell-omsa</description>
                     <delay>60m</delay>
                     <value_type>CHAR</value_type>
                     <trends>0</trends>
+                    <description>iDRACライセンスの違いは以下のURLを参照してください。
+https://www.dell.com/support/manuals/ja-jp/xc7525-core/idrac9_7.xx_ug/idrac9%E3%81%AE%E3%83%A9%E3%82%A4%E3%82%BB%E3%83%B3%E3%82%B9%E6%A9%9F%E8%83%BD?guid=guid-e8a767a7-3648-48d7-945a-a700da1d5c96&amp;lang=ja-jp</description>
                     <inventory_link>SOFTWARE</inventory_link>
                     <tags>
                         <tag>

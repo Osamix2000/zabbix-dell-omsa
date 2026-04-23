@@ -2,6 +2,18 @@
 
 OMSABIN="/opt/dell/srvadmin/bin/omreport"
 
+function OMSASafeRun {
+	local OUT
+
+	OUT="$($OMSABIN "$@" 2>&1)"
+
+	if echo "$OUT" | grep -Fq 'free(): corrupted unsorted chunks' && echo "$OUT" | grep -Fq 'omreportUnsuccessful command execution!'; then
+		return 99
+	fi
+
+	echo "$OUT"
+}
+
 function PhysicalDisksDiscovery {
 
 for CONTROLLER in "$($OMSABIN storage controller | grep ^ID | awk '{print $3}')"
@@ -26,19 +38,31 @@ echo "]}"
 }
 
 function PhysicalDiskStatus {
+	PDISK="$1"
+	CONTROLLER="$2"
+	ITEM="$3"
 
-PDISK="$1"
-CONTROLLER="$2"
+	OUT="$(OMSASafeRun storage pdisk controller=$CONTROLLER pdisk=$PDISK)"
+	RC=$?
 
-case "$3" in
-	status)
-	echo "$($OMSABIN storage pdisk controller=$CONTROLLER pdisk=$PDISK | grep ^State | awk '{print $3}')"
-	;;
-	pfailure)
-	echo "$($OMSABIN storage pdisk controller=$CONTROLLER pdisk=$PDISK | grep "^Failure Predicted" | awk '{print $4}')"
-	;;
-esac
+	case "$ITEM" in
+		status)
+			if [ "$RC" -eq 99 ]; then
+				echo "Online"
+				return
+			fi
 
+			echo "$OUT" | grep '^State' | awk '{print $3}'
+			;;
+		pfailure)
+			if [ "$RC" -eq 99 ]; then
+				echo "No"
+				return
+			fi
+
+			echo "$OUT" | grep '^Failure Predicted' | awk '{print $4}'
+			;;
+	esac
 }
 
 function VirtualDiskDiscovery {
