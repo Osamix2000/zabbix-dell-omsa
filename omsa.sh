@@ -21,6 +21,10 @@ IPMI_CACHE_TTL="${IPMI_CACHE_TTL:-240}"
 IPMI_SENSOR_CACHE_LOCK="${IPMI_SENSOR_CACHE_LOCK:-/tmp/dell_hw_monitor_ipmi_sensor_${SCRIPT_UID}.lock}"
 PERCCLI_TIMEOUT="${PERCCLI_TIMEOUT:-12}"
 IPMI_SENSOR_CACHE="${IPMI_SENSOR_CACHE:-/tmp/dell_hw_monitor_ipmi_sensor_${SCRIPT_UID}.cache}"
+# OMSAのBMC/iDRAC情報は初回取得が不安定な場合があるため、短時間キャッシュします。
+OMSA_BMC_CACHE_TTL="${OMSA_BMC_CACHE_TTL:-240}"
+OMSA_BMC_CACHE="${OMSA_BMC_CACHE:-/tmp/dell_hw_monitor_omsa_bmc_${SCRIPT_UID}.cache}"
+OMSA_BMC_CACHE_LOCK="${OMSA_BMC_CACHE_LOCK:-/tmp/dell_hw_monitor_omsa_bmc_${SCRIPT_UID}.lock}"
 # 温度センサーが取得不可の場合に返す値です。ZabbixのNumeric(float)向けに文字列ではなく数値を返します。
 TEMP_UNSUPPORTED_VALUE="${TEMP_UNSUPPORTED_VALUE:--273}"
 # ZabbixのunitsがBの場合、表示は1024換算になるため、既定では表示合わせで1024換算にします。
@@ -370,6 +374,193 @@ function IPMISensorOutput {
 	printf '%s
 ' "$OUT"
 }
+function OMSABmcOutput {
+	local OUT WAIT_COUNT TMPFILE
+
+	# BMC/iDRAC情報はZabbixの複数アイテムから同時に呼ばれやすく、初回に空やタイムアウトになる場合があるためキャッシュする
+	if CacheIsFresh "$OMSA_BMC_CACHE" "$OMSA_BMC_CACHE_TTL"; then
+		cat "$OMSA_BMC_CACHE"
+		return 0
+	fi
+
+	RemoveStaleIPMILock "$OMSA_BMC_CACHE_LOCK" 30
+
+	if mkdir "$OMSA_BMC_CACHE_LOCK" 2>/dev/null; then
+		OUT="$(OMSARun chassis bmc 2>/dev/null)" || true
+		if [ -z "$OUT" ]; then
+			sleep 1
+			OUT="$(OMSARun chassis bmc 2>/dev/null)" || true
+		fi
+
+		if [ -n "$OUT" ]; then
+			TMPFILE="${OMSA_BMC_CACHE}.$$"
+			printf '%s
+' "$OUT" > "$TMPFILE" 2>/dev/null && mv -f "$TMPFILE" "$OMSA_BMC_CACHE" 2>/dev/null || rm -f "$TMPFILE" 2>/dev/null || true
+			chmod 644 "$OMSA_BMC_CACHE" 2>/dev/null || true
+			rmdir "$OMSA_BMC_CACHE_LOCK" 2>/dev/null || true
+			printf '%s
+' "$OUT"
+			return 0
+		fi
+
+		rmdir "$OMSA_BMC_CACHE_LOCK" 2>/dev/null || true
+		# 取得に失敗しても古いキャッシュがあれば、初回Unsupported化を避けるため利用する
+		if [ -s "$OMSA_BMC_CACHE" ]; then
+			cat "$OMSA_BMC_CACHE"
+			return 0
+		fi
+		return 1
+	fi
+
+	WAIT_COUNT=0
+	while [ "$WAIT_COUNT" -lt 20 ]; do
+		if CacheIsFresh "$OMSA_BMC_CACHE" "$OMSA_BMC_CACHE_TTL"; then
+			cat "$OMSA_BMC_CACHE"
+			return 0
+		fi
+		sleep 0.1
+		WAIT_COUNT=$((WAIT_COUNT + 1))
+	done
+
+	if [ -s "$OMSA_BMC_CACHE" ]; then
+		cat "$OMSA_BMC_CACHE"
+		return 0
+	fi
+	return 1
+}
+
+function ExtractOmreportField {
+	local FIELD="$1"
+	awk -F':' -v FIELD="$FIELD" '
+		$0 ~ "^[[:space:]]*" FIELD "[[:space:]]*:" {
+			$1=""
+			sub(/^:/, "", $0)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+			print $0
+			exit
+		}
+	'
+}
+
+function ExtractBmcIPv4Field {
+	local FIELD="$1"
+	awk -F':' -v FIELD="$FIELD" '
+		/^[[:space:]]*IPv4 Address[[:space:]]*:/ {
+			v=$2
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+			if (FIELD == "IP Address" && v ~ /^[0-9.]+$/) { print v; exit }
+		}
+		/^[[:space:]]*IPv4 Address[[:space:]]*$/ { in_ipv4=1; next }
+		in_ipv4 && /^[[:space:]]*IPv6 Address/ { in_ipv4=0 }
+		in_ipv4 && $0 ~ "^[[:space:]]*" FIELD "[[:space:]]*:" {
+			$1=""
+			sub(/^:/, "", $0)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+			print $0
+			exit
+		}
+	'
+}
+
+function NormalizeLicenseValue {
+	local VALUE="$*"
+	VALUE="$(printf '%s
+' "$VALUE" | Trim)"
+	case "$VALUE" in
+		""|BMC|bmc|Unknown|UNKNOWN|None|none|Unsupported|Baseboard*)
+			return 1
+			;;
+	esac
+	if printf '%s
+' "$VALUE" | grep -Eiq 'Enterprise|Express|Basic|Datacenter|Data[ -]?Center|iDRAC[0-9].*(Enterprise|Express|Basic)'; then
+		printf '%s
+' "$VALUE"
+		return 0
+	fi
+	# Device Typeが単なるBMCではなく、ライセンスらしい文字列の場合のみ返す
+	return 1
+}
+
+function ExtractBmcLicenseOMSA {
+	local OUT="$1"
+	local VALUE
+	VALUE="$(printf '%s
+' "$OUT" | ExtractOmreportField "License Description")"
+	VALUE="$(NormalizeLicenseValue "$VALUE")" && { printf '%s
+' "$VALUE"; return 0; }
+	VALUE="$(printf '%s
+' "$OUT" | ExtractOmreportField "License Type")"
+	VALUE="$(NormalizeLicenseValue "$VALUE")" && { printf '%s
+' "$VALUE"; return 0; }
+	VALUE="$(printf '%s
+' "$OUT" | ExtractOmreportField "License")"
+	VALUE="$(NormalizeLicenseValue "$VALUE")" && { printf '%s
+' "$VALUE"; return 0; }
+	VALUE="$(printf '%s
+' "$OUT" | ExtractOmreportField "Device Type")"
+	VALUE="$(NormalizeLicenseValue "$VALUE")" && { printf '%s
+' "$VALUE"; return 0; }
+	return 1
+}
+
+function FindRacadm {
+	local BIN
+	for BIN in \
+		racadm \
+		/opt/dell/srvadmin/sbin/racadm \
+		/opt/dell/srvadmin/bin/racadm \
+		/opt/dell/srvadmin/bin/idracadm7 \
+		/opt/dell/srvadmin/sbin/idracadm7
+	do
+		if command -v "$BIN" >/dev/null 2>&1; then
+			command -v "$BIN"
+			return 0
+		fi
+		[ -x "$BIN" ] && echo "$BIN" && return 0
+	done
+	return 1
+}
+
+function RacadmLicense {
+	local BIN OUT VALUE
+	BIN="$(FindRacadm)" || return 1
+	OUT="$(RunWithTimeoutValue "$COMMAND_TIMEOUT" "$BIN" license view 2>/dev/null)" || return 1
+	VALUE="$(printf '%s
+' "$OUT" | awk -F'=' '/License Description|License Type|License/ {v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); print v; exit}')"
+	[ -n "$VALUE" ] || VALUE="$(printf '%s
+' "$OUT" | awk -F':' '/License Description|License Type|License/ {v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); print v; exit}')"
+	VALUE="$(NormalizeLicenseValue "$VALUE")" || return 1
+	printf '%s
+' "$VALUE"
+}
+
+function RedfishLicense {
+	local OUT MEMBER VALUE
+	OUT="$(RedfishGet /redfish/v1/Dell/Managers/iDRAC.Embedded.1/DellLicenseCollection 2>/dev/null)" || return 1
+	[ -n "$OUT" ] || return 1
+	VALUE="$(printf '%s
+' "$OUT" | tr -d '\n' | JsonStringValue "LicenseDescription")"
+	VALUE="$(NormalizeLicenseValue "$VALUE")" && { printf '%s
+' "$VALUE"; return 0; }
+	MEMBER="$(printf '%s
+' "$OUT" | tr -d '\n' | sed -n 's/.*"@odata.id"[[:space:]]*:[[:space:]]*"\([^"]*DellLicenseCollection[^"]*\)".*/\1/p' | head -1)"
+	[ -n "$MEMBER" ] || return 1
+	OUT="$(RedfishGet "$MEMBER" 2>/dev/null)" || return 1
+	VALUE="$(printf '%s
+' "$OUT" | tr -d '\n' | JsonStringValue "LicenseDescription")"
+	VALUE="$(NormalizeLicenseValue "$VALUE")" && { printf '%s
+' "$VALUE"; return 0; }
+	VALUE="$(printf '%s
+' "$OUT" | tr -d '\n' | JsonStringValue "LicenseType")"
+	VALUE="$(NormalizeLicenseValue "$VALUE")" && { printf '%s
+' "$VALUE"; return 0; }
+	VALUE="$(printf '%s
+' "$OUT" | tr -d '\n' | JsonStringValue "Name")"
+	VALUE="$(NormalizeLicenseValue "$VALUE")" && { printf '%s
+' "$VALUE"; return 0; }
+	return 1
+}
+
 function DmiGet {
 	local KEY="$1"
 	IsCommand dmidecode || return 127
@@ -1030,41 +1221,51 @@ function PowerStatus {
 function BmcInfo {
 	local MODE="$1"
 	local OUT VALUE
-	OUT="$(OMSARun chassis bmc 2>/dev/null)" || true
-	if [ -n "$OUT" ] && echo "$OUT" | grep -q "Remote Access Device"; then
+	OUT="$(OMSABmcOutput 2>/dev/null)" || true
+	if [ -n "$OUT" ]; then
 		case "$MODE" in
 			device_type)
-				VALUE="$(echo "$OUT" | awk -F':' '/Device Type/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+				VALUE="$(ExtractBmcLicenseOMSA "$OUT")"
 				;;
 			ipmi_version)
-				VALUE="$(echo "$OUT" | awk -F':' '/IPMI Version/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+				VALUE="$(printf '%s
+' "$OUT" | ExtractOmreportField "IPMI Version")"
 				;;
 			sessions_possible)
-				VALUE="$(echo "$OUT" | awk -F':' '/Number of Possible Active Sessions/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+				VALUE="$(printf '%s
+' "$OUT" | ExtractOmreportField "Number of Possible Active Sessions")"
 				;;
 			sessions_active)
-				VALUE="$(echo "$OUT" | awk -F':' '/Number of Current Active Sessions/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+				VALUE="$(printf '%s
+' "$OUT" | ExtractOmreportField "Number of Current Active Sessions")"
 				;;
 			ipmi_over_lan)
-				VALUE="$(echo "$OUT" | awk -F':' '/Enable IPMI Over LAN/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+				VALUE="$(printf '%s
+' "$OUT" | ExtractOmreportField "Enable IPMI Over LAN")"
 				;;
 			sol_enabled)
-				VALUE="$(echo "$OUT" | awk -F':' '/SOL Enabled/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+				VALUE="$(printf '%s
+' "$OUT" | ExtractOmreportField "SOL Enabled")"
 				;;
 			mac)
-				VALUE="$(echo "$OUT" | awk -F':' '/MAC Address/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+				VALUE="$(printf '%s
+' "$OUT" | ExtractOmreportField "MAC Address")"
 				;;
 			ipv4)
-				VALUE="$(echo "$OUT" | awk '/^IPv4 Address/ {in_block=1; next} in_block && NF==0 {in_block=0; next} in_block && $0 ~ /IP Address[[:space:]]*:/ {sub(/.*IP Address[[:space:]]*:[[:space:]]*/, "", $0); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0); print $0; exit}')"
+				VALUE="$(printf '%s
+' "$OUT" | ExtractBmcIPv4Field "IP Address")"
 				;;
 			ipv4_source)
-				VALUE="$(echo "$OUT" | awk '/IP Address Source[[:space:]]*:/ {split($0,a,":"); gsub(/^ *| *$/, "", a[2]); print a[2]; exit}')"
+				VALUE="$(printf '%s
+' "$OUT" | ExtractBmcIPv4Field "IP Address Source")"
 				;;
 			ipv4_subnet)
-				VALUE="$(echo "$OUT" | awk '/IP Subnet[[:space:]]*:/ {split($0,a,":"); gsub(/^ *| *$/, "", a[2]); print a[2]; exit}')"
+				VALUE="$(printf '%s
+' "$OUT" | ExtractBmcIPv4Field "IP Subnet")"
 				;;
 			ipv4_gateway)
-				VALUE="$(echo "$OUT" | awk '/IP Gateway[[:space:]]*:/ {split($0,a,":"); gsub(/^ *| *$/, "", a[2]); print a[2]; exit}')"
+				VALUE="$(printf '%s
+' "$OUT" | ExtractBmcIPv4Field "IP Gateway")"
 				;;
 		esac
 		[ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
@@ -1072,6 +1273,10 @@ function BmcInfo {
 
 	case "$MODE" in
 		device_type)
+			VALUE="$(RedfishLicense)"
+			[ -n "$VALUE" ] && PrintValue "Redfish" "$VALUE" && return
+			VALUE="$(RacadmLicense)"
+			[ -n "$VALUE" ] && PrintValue "racadm" "$VALUE" && return
 			PrintValue "none" "Unsupported"
 			;;
 		ipmi_version)
