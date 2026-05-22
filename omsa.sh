@@ -496,9 +496,12 @@ function ExtractBmcLicenseOMSA {
 ' "$OUT" | ExtractOmreportField "License")"
 	VALUE="$(NormalizeLicenseValue "$VALUE")" && { printf '%s
 ' "$VALUE"; return 0; }
+
+	# OMSAで取得できたDevice Typeは既存テンプレート互換のため、そのまま返します。
+	# Redfish/racadm等の非OMSA取得でBMC/Baseboard系しか取れない場合は、ライセンス種別ではないためUnsupported扱いにします。
 	VALUE="$(printf '%s
-' "$OUT" | ExtractOmreportField "Device Type")"
-	VALUE="$(NormalizeLicenseValue "$VALUE")" && { printf '%s
+' "$OUT" | ExtractOmreportField "Device Type" | Trim)"
+	[ -n "$VALUE" ] && { printf '%s
 ' "$VALUE"; return 0; }
 	return 1
 }
