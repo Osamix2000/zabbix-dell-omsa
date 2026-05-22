@@ -1,607 +1,1611 @@
 #!/bin/bash
 
-OMSABIN="/opt/dell/srvadmin/bin/omreport"
+# Dellハードウェア監視用スクリプト
+# 既存のomsa.*キー互換を維持しつつ、OMSA未導入環境ではローカルコマンド等へフォールバックします。
 
-function OMSASafeRun {
-	local OUT
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-	OUT="$($OMSABIN "$@" 2>&1)"
+SCRIPT_VERSION="2.0.0"
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_UID="$(id -u 2>/dev/null || echo unknown)"
 
-	if echo "$OUT" | grep -Fq 'free(): corrupted unsorted chunks' && echo "$OUT" | grep -Fq 'omreportUnsuccessful command execution!'; then
-		return 99
+OMSABIN="${OMSABIN:-/opt/dell/srvadmin/bin/omreport}"
+REDFISH_BASE_ENV="${REDFISH_BASE:-}"
+REDFISH_BASE="${REDFISH_BASE:-https://169.254.0.1}"
+REDFISH_CONFIG="${REDFISH_CONFIG:-/home/zabbix/.config/dell-redfish.conf}"
+COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-12}"
+OMSA_TIMEOUT="${OMSA_TIMEOUT:-12}"
+IPMI_TIMEOUT="${IPMI_TIMEOUT:-12}"
+# Zabbixから同時に複数アイテムが実行されるとipmitoolが詰まりやすいため、既定では長めにキャッシュします。
+IPMI_CACHE_TTL="${IPMI_CACHE_TTL:-240}"
+IPMI_SENSOR_CACHE_LOCK="${IPMI_SENSOR_CACHE_LOCK:-/tmp/dell_hw_monitor_ipmi_sensor_${SCRIPT_UID}.lock}"
+PERCCLI_TIMEOUT="${PERCCLI_TIMEOUT:-12}"
+IPMI_SENSOR_CACHE="${IPMI_SENSOR_CACHE:-/tmp/dell_hw_monitor_ipmi_sensor_${SCRIPT_UID}.cache}"
+# 温度センサーが取得不可の場合に返す値です。ZabbixのNumeric(float)向けに文字列ではなく数値を返します。
+TEMP_UNSUPPORTED_VALUE="${TEMP_UNSUPPORTED_VALUE:--273}"
+# ZabbixのunitsがBの場合、表示は1024換算になるため、既定では表示合わせで1024換算にします。
+# 厳密な10進バイト値を返したい場合は SIZE_BASE=1000 を指定してください。
+SIZE_BASE="${SIZE_BASE:-1024}"
+PERCCLI_BIN="${PERCCLI_BIN:-}"
+DEBUG="0"
+SOURCE_ONLY="0"
+LAST_SOURCE=""
+INSTALL_PACKAGES_FORCE="0"
+
+function PrintHelp {
+	cat <<HELP
+【Dellハードウェア監視用スクリプト v${SCRIPT_VERSION}】
+
+フォーク元:
+	https://github.com/ronivay/zabbix-dell-omsa
+HELP
+	cat <<HELP
+
+使い方:
+	${SCRIPT_NAME} <項目> [引数...]
+	${SCRIPT_NAME} --help
+	${SCRIPT_NAME} --backend-status
+	${SCRIPT_NAME} --test-omsa
+	${SCRIPT_NAME} --test-local
+	${SCRIPT_NAME} --test-ipmi
+	${SCRIPT_NAME} --test-perccli
+	${SCRIPT_NAME} --test-redfish
+	${SCRIPT_NAME} --install-packages
+	${SCRIPT_NAME} --create-redfish-conf
+	${SCRIPT_NAME} --debug <項目> [引数...]
+	${SCRIPT_NAME} --source <項目> [引数...]
+
+主な項目:
+	model                         モデル名を取得
+	stag                          サービスタグを取得
+	bios                          BIOSバージョンを取得
+	idrac                         iDRAC/BMC情報を取得
+	status                        全体状態を取得
+	fandiscovery                  ファン一覧を取得
+	fanstatus <fan> <status|rpm>  ファン状態/RPMを取得
+	tempdiscovery                 温度センサー一覧を取得
+	tempstatus <temp>              温度を取得(空白入り名称も自動結合)
+	psudiscovery                  電源ユニット系センサー一覧を取得
+	psustatus <psu>               電源ユニット系状態を取得
+	vddiscovery                   仮想ディスク一覧を取得
+	vdstatus <vd> <ctrl> <status|raid|size>
+	pddiscovery                   物理ディスク一覧を取得
+	pdstatus <pd> <ctrl> <status|pfailure>
+	battdiscovery                 バッテリー/BBU一覧を取得
+	battstatus <battery> <health|status|reading|probe>
+	bmc <項目>                    BMC/iDRAC関連情報を取得
+
+手動作業用オプション:
+	--install-packages             現在のOSに合わせて必要パッケージをインストールし、IPMI関連サービスを有効化
+	--create-redfish-conf          Redfish用curl設定ファイルを対話形式で作成
+
+取得優先順位:
+	1. OMSA
+	2. ローカルコマンド(dmidecode, ipmitool -I open, perccli)
+	3. Redfish
+	4. racadm(現時点では補助扱い)
+
+補足:
+	OMSAで正常に取得できる場合はOMSAの値を優先します。
+	OMSAが未導入、失敗、非対応、対象項目が空の場合のみ他の方法で取得します。
+	OMSAがCritical/Failed/Degraded等の異常値を返した場合は、その値を採用します。
+	状態値は可能な範囲でOK/Warning/Critical/Unknown/Unsupportedへ正規化します。
+	取得できない項目はUnknownまたはUnsupportedを返します。
+	温度の数値アイテムは、取得不可時に既定で-273を返します。
+	Redfish認証情報は/home/zabbix/.config/dell-redfish.confを使用します。
+	ipmitoolのsensor結果はキャッシュし、Zabbix実行時のタイムアウトと多重実行を抑制します。
+	perccliはDell配布ファイルから別途導入する想定です。
+	仮想ディスクサイズはZabbixのB単位表示に合わせ、既定で1024換算します。厳密な10進換算にしたい場合はSIZE_BASE=1000を指定してください。
+
+現在のOS向けのインストールコマンド例:
+HELP
+	PrintInstallCommands 2>/dev/null || cat <<'HELP_FALLBACK'
+	OSを判定できませんでした。Ubuntu/Debian系、CentOS7、AlmaLinux/RHEL/Rocky 8以降等で実行してください。
+HELP_FALLBACK
+	echo
+}
+function DebugLog {
+	[ "$DEBUG" = "1" ] && echo "DEBUG: $*" >&2
+}
+
+function SetSource {
+	LAST_SOURCE="$1"
+}
+
+function PrintValue {
+	local SRC="$1"
+	shift
+	SetSource "$SRC"
+	if [ "$SOURCE_ONLY" = "1" ]; then
+		echo "$LAST_SOURCE"
+	else
+		echo "$*"
 	fi
-
-	echo "$OUT"
 }
 
-function PhysicalDisksDiscovery {
-
-for CONTROLLER in "$($OMSABIN storage controller | grep ^ID | awk '{print $3}')"
-do
-
-IFS=$'\n' read -r -d '' -a DISKS <<< "$($OMSABIN storage pdisk controller=$CONTROLLER | grep ^ID | awk '{print $3}')"
-
-for DISK in "${DISKS[@]}"; do
-  RESULT+=$(echo -e "\n{\n\"{#PDISK}\": \"$DISK\",\n\"{#CONTROLLER}\": \"$CONTROLLER\" \n},")
-done
-
-done
-echo -e "{"
-echo -e "\"data\":["
-
-JSON=$(echo "$RESULT" | sed '$s/,$//')
-
-echo "$JSON"
-echo "]}"
-
-
+function PrintNoData {
+	local SRC="$1"
+	SetSource "$SRC"
+	if [ "$SOURCE_ONLY" = "1" ]; then
+		echo "$LAST_SOURCE"
+	fi
+	return 1
 }
 
-function PhysicalDiskStatus {
-	PDISK="$1"
-	CONTROLLER="$2"
-	ITEM="$3"
+function IsCommand {
+	command -v "$1" >/dev/null 2>&1
+}
 
-	OUT="$(OMSASafeRun storage pdisk controller=$CONTROLLER pdisk=$PDISK)"
-	RC=$?
+function RunWithTimeoutValue {
+	local TIMEOUT_VALUE="$1"
+	shift
+	if IsCommand timeout; then
+		timeout "$TIMEOUT_VALUE" "$@"
+	else
+		"$@"
+	fi
+}
 
-	case "$ITEM" in
-		status)
-			if [ "$RC" -eq 99 ]; then
-				echo "Online"
-				return
-			fi
+function RunWithTimeout {
+	RunWithTimeoutValue "$COMMAND_TIMEOUT" "$@"
+}
 
-			echo "$OUT" | grep '^State' | awk '{print $3}'
+function Trim {
+	sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+function JsonEscape {
+	sed 's/\\/\\\\/g;s/"/\\"/g'
+}
+
+function EmptyLLD {
+	echo '{"data":[]}'
+}
+
+function NormalizeHealth {
+	case "$1" in
+		Ok|OK|ok|Optimal|Opt|Optl|Online|Onln|Ready|Enabled)
+			echo "OK"
 			;;
-		pfailure)
-			if [ "$RC" -eq 99 ]; then
-				echo "No"
-				return
-			fi
-
-			echo "$OUT" | grep '^Failure Predicted' | awk '{print $4}'
+		Non-Critical|NonCritical|Warning|Warn|Dgrd|Pdgd|Degraded|Partially*)
+			echo "Warning"
+			;;
+		Critical|Failed|Failure|Offln|Offline|Msng|Missing|UBad|Bad)
+			echo "Critical"
+			;;
+		"")
+			echo "Unknown"
+			;;
+		*)
+			echo "$1"
 			;;
 	esac
 }
 
-function VirtualDiskDiscovery {
-
-for CONTROLLER in "$($OMSABIN storage controller | grep ^ID | awk '{print $3}')"
-do
-
-IFS=$'\n' read -r -d '' -a VDISKS <<< "$($OMSABIN storage vdisk controller=$CONTROLLER| grep '^ID' |  awk '{print $3}')"
-
-for VDISK in "${VDISKS[@]}"
-do
-  RESULT+=$(echo -e "\n{\n\"{#VDISK}\": \"$VDISK\",\n\"{#CONTROLLER}\": \"$CONTROLLER\" \n},")
-done
-
-done
-
-echo -e "{"
-echo -e "\"data\":["
-
-JSON=$(echo "$RESULT" | sed '$s/,$//')
-
-echo "$JSON"
-echo "]}"
-
+function NormalizePdState {
+	case "$1" in
+		Onln|Online)
+			echo "Online"
+			;;
+		UGood)
+			echo "Ready"
+			;;
+		Offln|Offline|Msng|Missing|UBad)
+			echo "Failed"
+			;;
+		rbld|Rbld|Rebuild)
+			echo "Rebuild"
+			;;
+		*)
+			echo "${1:-Unknown}"
+			;;
+	esac
 }
 
-function VirtualDiskStatus {
+function SizeToBytes {
+	local VALUE="$1"
+	local UNIT="$2"
+	local BASE="${SIZE_BASE:-1024}"
 
-VDISK="$1"
-CONTROLLER="$2"
+	case "$BASE" in
+		1000|1024)
+			;;
+		*)
+			BASE="1024"
+			;;
+	esac
 
-case "$3" in 
-	status)
-	echo "$($OMSABIN storage vdisk controller=$CONTROLLER vdisk=$VDISK| grep ^Status | awk '{print $3}')"
-	;;
-	raid)
-	echo "$($OMSABIN storage vdisk controller=$CONTROLLER vdisk=$VDISK | grep ^Layout | awk '{print $3}')"
-	;;
-	size)
-	echo "$($OMSABIN storage vdisk controller=$CONTROLLER vdisk=$VDISK | grep ^Size | awk '{print $5}' | grep -Eo '[0-9]+')"
-	;;
-	*)
-	exit
-	;;
-esac
-
+	awk -v V="$VALUE" -v U="$UNIT" -v B="$BASE" 'BEGIN {
+		U=toupper(U)
+		M=1
+		if (U=="KB" || U=="KIB") M=B
+		else if (U=="MB" || U=="MIB") M=B*B
+		else if (U=="GB" || U=="GIB") M=B*B*B
+		else if (U=="TB" || U=="TIB") M=B*B*B*B
+		else if (U=="PB" || U=="PIB") M=B*B*B*B*B
+		printf "%.0f\n", V*M
+	}'
 }
 
-function FanDiscovery {
-
-IFS=$'\n' read -r -d '' -a FANS <<< "$($OMSABIN chassis fans | grep ^Index | awk '{print $3}')"
-
-for FAN in "${FANS[@]}"; do
-  RESULT+=$(echo -e "\n{\n\"{#FAN}\": \"$FAN\"\n},")
-done
-
-echo -e "{"
-echo -e "\"data\":["
-
-JSON=$(echo "$RESULT" | sed '$s/,$//')
-
-echo "$JSON"
-echo "]}"
-
+function OMSARun {
+	[ -x "$OMSABIN" ] || return 127
+	RunWithTimeoutValue "$OMSA_TIMEOUT" "$OMSABIN" "$@" 2>&1
 }
 
-function FanStatus {
-
-FAN="$1"
-ITEM="$2"
-
-[[ "$ITEM" == "rpm" ]] && REPLY="$($OMSABIN chassis fans index=$FAN | grep ^Reading | awk '{print $3}')"
-
-[[ "$ITEM" == "status" ]] && REPLY="$($OMSABIN chassis fans index=$FAN | grep ^Status | awk '{print $3}')"
-
-echo "$REPLY"
-
+function OMSAUsable {
+	[ -x "$OMSABIN" ] || return 1
+	local OUT
+	OUT="$(OMSARun chassis info)" || return 1
+	[ -n "$OUT" ] || return 1
+	echo "$OUT" | grep -q "^Chassis" || return 1
+	return 0
 }
 
-function PsuDiscovery {
-
-IFS=$'\n' read -r -d '' -a PSUS <<< "$($OMSABIN chassis pwrsupplies | grep ^Index | awk '{print $3}')"
-
-for PSU in "${PSUS[@]}"; do
-  RESULT+=$(echo -e "\n{\n\"{#PSU}\": \"$PSU\"\n},")
-done
-
-echo -e "{"
-echo -e "\"data\":["
-
-JSON=$(echo "$RESULT" | sed '$s/,$//')
-
-echo "$JSON"
-echo "]}"
-
+function OMSAValueOrEmpty {
+	local OUT
+	OUT="$(OMSARun "$@")" || return 1
+	[ -n "$OUT" ] || return 1
+	echo "$OUT"
+	return 0
 }
 
-function PsuStatus {
+function FindPerccli {
+	if [ -n "$PERCCLI_BIN" ] && [ -x "$PERCCLI_BIN" ]; then
+		echo "$PERCCLI_BIN"
+		return 0
+	fi
 
-PSU="$1"
+	for BIN in \
+		/opt/MegaRAID/perccli/perccli64 \
+		/opt/MegaRAID/perccli/perccli \
+		/opt/MegaRAID/storcli/storcli64 \
+		/opt/MegaRAID/storcli/storcli \
+		/usr/sbin/perccli64 \
+		/usr/sbin/perccli \
+		/usr/sbin/storcli64 \
+		/usr/sbin/storcli \
+		/usr/bin/perccli64 \
+		/usr/bin/perccli \
+		/usr/bin/storcli64 \
+		/usr/bin/storcli
+	do
+		[ -x "$BIN" ] && echo "$BIN" && return 0
+	done
 
-echo "$($OMSABIN chassis pwrsupplies | grep -A1 "^Index.*$PSU" | tail -1 |  awk '{print $3}')"
-
+	return 1
 }
 
-function RAMDiscovery {
-
-IFS=$'\n' read -r -d '' -a RAMS <<< "$($OMSABIN chassis memory | grep "Index" | awk '{print $3}' | grep -Eo '[0-9]+')"
-
-for RAM in "${RAMS[@]}"; do
-  RESULT+=$(echo -e "\n{\n\"{#RAM}\": \"$RAM\"\n},")
-done
-
-echo -e "{"
-echo -e "\"data\":["
-
-JSON=$(echo "$RESULT" | sed '$s/,$//')
-
-echo "$JSON"
-echo "]}"
-
+function PerccliRun {
+	local BIN
+	BIN="$(FindPerccli)" || return 127
+	RunWithTimeoutValue "$PERCCLI_TIMEOUT" "$BIN" "$@" 2>&1
 }
 
-function RAMStatus {
-
-RAM="$1"
-
-STATUS="$($OMSABIN chassis memory index=$RAM | grep "^Status" | awk '{print $3}')"
-
-echo "$STATUS"
-
+function PerccliControllers {
+	local OUT
+	OUT="$(PerccliRun show)" || return 1
+	echo "$OUT" | awk '$1 ~ /^[0-9]+$/ {print $1}'
 }
 
-function TempDiscovery {
-
-IFS=$'\n' read -r -d '' -a TEMPS <<< "$($OMSABIN chassis temps | grep "^Index\|^Probe Name" | cut -d':' -f2 | sed 's/^ //' | paste - -)"
-
-for TEMP in "${TEMPS[@]}"
-do
-  read -a TEMP_SPLIT <<< "$TEMP"
-
-  INDEX=${TEMP_SPLIT[0]}
-  TEMP=${TEMP_SPLIT[@]:1}
-
-RESULT+=$(echo -e "\n{\n\"{#TEMP}\": \"$TEMP\",\n\"{#TEMPINDEX}\": \"$INDEX\" \n},")
-done
-
-echo -e "{"
-echo -e "\"data\":["
-
-JSON=$(echo "$RESULT" | sed '$s/,$//')
-
-echo "$JSON"
-echo "]}"
-
+function IPMIRun {
+	IsCommand ipmitool || return 127
+	RunWithTimeoutValue "$IPMI_TIMEOUT" ipmitool -I open "$@" 2>&1
 }
 
-function TempStatus {
+function CacheIsFresh {
+	local FILE="$1"
+	local TTL="$2"
+	local NOW MTIME AGE
+	[ -s "$FILE" ] || return 1
+	NOW="$(date +%s)"
+	MTIME="$(stat -c %Y "$FILE" 2>/dev/null)" || return 1
+	AGE=$((NOW - MTIME))
+	[ "$AGE" -le "$TTL" ]
+}
 
-INDEX="$1"
 
-STATUS="$($OMSABIN chassis temps index=$INDEX | grep ^Reading | awk '{print $3}')"
+function RemoveStaleIPMILock {
+	local LOCK="$1"
+	local LIMIT="${2:-30}"
+	local NOW MTIME AGE
+	[ -d "$LOCK" ] || return 0
+	NOW="$(date +%s)"
+	MTIME="$(stat -c %Y "$LOCK" 2>/dev/null)" || return 0
+	AGE=$((NOW - MTIME))
+	if [ "$AGE" -gt "$LIMIT" ]; then
+		rmdir "$LOCK" 2>/dev/null || true
+	fi
+}
 
-echo "$STATUS"
+function IPMISensorOutput {
+	local OUT WAIT_COUNT TMPFILE
 
+	# 新しいキャッシュがあれば即返す
+	if CacheIsFresh "$IPMI_SENSOR_CACHE" "$IPMI_CACHE_TTL"; then
+		cat "$IPMI_SENSOR_CACHE"
+		return 0
+	fi
+
+	RemoveStaleIPMILock "$IPMI_SENSOR_CACHE_LOCK" 30
+
+	# 複数アイテム同時実行時にipmitoolを多重起動しないように簡易ロックする
+	if mkdir "$IPMI_SENSOR_CACHE_LOCK" 2>/dev/null; then
+		OUT="$(IPMIRun sensor)"
+		if [ $? -ne 0 ] || [ -z "$OUT" ]; then
+			rmdir "$IPMI_SENSOR_CACHE_LOCK" 2>/dev/null || true
+			if [ -s "$IPMI_SENSOR_CACHE" ]; then
+				cat "$IPMI_SENSOR_CACHE"
+				return 0
+			fi
+			return 1
+		fi
+		TMPFILE="${IPMI_SENSOR_CACHE}.$$"
+		printf '%s
+' "$OUT" > "$TMPFILE" 2>/dev/null && mv -f "$TMPFILE" "$IPMI_SENSOR_CACHE" 2>/dev/null || rm -f "$TMPFILE" 2>/dev/null || true
+		chmod 644 "$IPMI_SENSOR_CACHE" 2>/dev/null || true
+		rmdir "$IPMI_SENSOR_CACHE_LOCK" 2>/dev/null || true
+		printf '%s
+' "$OUT"
+		return 0
+	fi
+
+	# 他プロセスが更新中の場合、少し待ってから新しいキャッシュを使う
+	WAIT_COUNT=0
+	while [ "$WAIT_COUNT" -lt 10 ]; do
+		if CacheIsFresh "$IPMI_SENSOR_CACHE" "$IPMI_CACHE_TTL"; then
+			cat "$IPMI_SENSOR_CACHE"
+			return 0
+		fi
+		sleep 0.1
+		WAIT_COUNT=$((WAIT_COUNT + 1))
+	done
+
+	# キャッシュが無い場合だけ最後に直接取得を試す
+	OUT="$(IPMIRun sensor)" || return 1
+	[ -n "$OUT" ] || return 1
+	TMPFILE="${IPMI_SENSOR_CACHE}.$$"
+	printf '%s
+' "$OUT" > "$TMPFILE" 2>/dev/null && mv -f "$TMPFILE" "$IPMI_SENSOR_CACHE" 2>/dev/null || rm -f "$TMPFILE" 2>/dev/null || true
+	chmod 644 "$IPMI_SENSOR_CACHE" 2>/dev/null || true
+	printf '%s
+' "$OUT"
+}
+function DmiGet {
+	local KEY="$1"
+	IsCommand dmidecode || return 127
+	RunWithTimeout dmidecode -s "$KEY" 2>/dev/null | head -1 | Trim
+}
+
+function LoadRedfishBaseFromConfig {
+	local CONF_BASE
+	[ -f "$REDFISH_CONFIG" ] || return 0
+	[ -n "$REDFISH_BASE_ENV" ] && return 0
+	CONF_BASE="$(sed -n 's/^#[[:space:]]*REDFISH_BASE=["'"'"']\{0,1\}\([^"'"'"'[:space:]]*\).*/\1/p' "$REDFISH_CONFIG" | head -1)"
+	[ -n "$CONF_BASE" ] && REDFISH_BASE="$CONF_BASE"
+}
+
+function RedfishAvailable {
+	[ -f "$REDFISH_CONFIG" ] || return 1
+	IsCommand curl || return 1
+	return 0
+}
+
+function RedfishGet {
+	local URI="$1"
+	RedfishAvailable || return 127
+	LoadRedfishBaseFromConfig
+	curl --config "$REDFISH_CONFIG" "${REDFISH_BASE}${URI}" 2>/dev/null
+}
+
+function JsonStringValue {
+	local KEY="$1"
+	sed -n "s/.*\"${KEY}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+}
+
+function JsonNumberValue {
+	local KEY="$1"
+	sed -n "s/.*\"${KEY}\"[[:space:]]*:[[:space:]]*\([0-9.]*\).*/\1/p" | head -1
+}
+
+function RedfishServiceRootValue {
+	local KEY="$1"
+	local OUT
+	OUT="$(RedfishGet /redfish/v1/)" || return 1
+	[ -n "$OUT" ] || return 1
+	echo "$OUT" | tr -d '\n' | JsonStringValue "$KEY"
+}
+
+function RedfishSystemValue {
+	local KEY="$1"
+	local OUT
+	OUT="$(RedfishGet /redfish/v1/Systems/System.Embedded.1)" || return 1
+	[ -n "$OUT" ] || return 1
+	echo "$OUT" | tr -d '\n' | JsonStringValue "$KEY"
+}
+
+function RedfishManagerValue {
+	local KEY="$1"
+	local OUT
+	OUT="$(RedfishGet /redfish/v1/Managers/iDRAC.Embedded.1)" || return 1
+	[ -n "$OUT" ] || return 1
+	echo "$OUT" | tr -d '\n' | JsonStringValue "$KEY"
+}
+
+function RedfishSystemHealth {
+	local OUT HEALTH
+	OUT="$(RedfishGet /redfish/v1/Systems/System.Embedded.1)" || return 1
+	[ -n "$OUT" ] || return 1
+	HEALTH="$(echo "$OUT" | tr -d '\n' | sed -n 's/.*"Status"[[:space:]]*:{[^}]*"HealthRollup"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+	[ -n "$HEALTH" ] || HEALTH="$(echo "$OUT" | tr -d '\n' | sed -n 's/.*"Status"[[:space:]]*:{[^}]*"Health"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+	[ -n "$HEALTH" ] || return 1
+	NormalizeHealth "$HEALTH"
 }
 
 function SystemModel {
+	local OUT VALUE
+	OUT="$(OMSAValueOrEmpty chassis info)"
+	VALUE="$(echo "$OUT" | awk -F':' '/^Chassis Model/ {print $2; exit}' | Trim)"
+	[ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
 
-STATUS="$($OMSABIN chassis info | grep "^Chassis Model" | cut -d':' -f2 | sed 's/^ //')"
-echo "$STATUS"
+	VALUE="$(DmiGet system-product-name)"
+	[ -n "$VALUE" ] && PrintValue "dmidecode" "$VALUE" && return
 
+	VALUE="$(RedfishSystemValue Model)"
+	[ -n "$VALUE" ] && PrintValue "Redfish" "$VALUE" && return
+
+	PrintValue "none" "Unknown"
 }
 
 function SystemServiceTag {
+	local OUT VALUE
+	OUT="$(OMSAValueOrEmpty chassis info)"
+	VALUE="$(echo "$OUT" | awk -F':' '/^Chassis Service Tag/ {print $2; exit}' | Trim)"
+	[ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
 
-STATUS="$($OMSABIN chassis info | grep "^Chassis Service Tag" | cut -d':' -f2 | sed 's/^ //')"
-echo "$STATUS"
+	VALUE="$(DmiGet system-serial-number)"
+	[ -n "$VALUE" ] && PrintValue "dmidecode" "$VALUE" && return
 
-}
+	VALUE="$(RedfishServiceRootValue ServiceTag)"
+	[ -n "$VALUE" ] && PrintValue "Redfish" "$VALUE" && return
 
-function SystemStatus {
+	VALUE="$(RedfishSystemValue SKU)"
+	[ -n "$VALUE" ] && PrintValue "Redfish" "$VALUE" && return
 
-if [[ -z "$($OMSABIN chassis | grep ":" | grep -v SEVERITY | cut -d':' -f1 | grep -v Ok)" ]]; then
-	echo "Ok"
-else
-	echo "Failure"
-fi
-
+	PrintValue "none" "Unknown"
 }
 
 function SystemBiosVersion {
+	local OUT VALUE
+	OUT="$(OMSAValueOrEmpty chassis bios)"
+	VALUE="$(echo "$OUT" | awk '/^Version/ {print $3; exit}' | Trim)"
+	[ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
 
-echo "$($OMSABIN chassis bios | grep '^Version' | awk '{print $3}')"
+	VALUE="$(DmiGet bios-version)"
+	[ -n "$VALUE" ] && PrintValue "dmidecode" "$VALUE" && return
 
+	VALUE="$(RedfishSystemValue BiosVersion)"
+	[ -n "$VALUE" ] && PrintValue "Redfish" "$VALUE" && return
+
+	PrintValue "none" "Unknown"
 }
 
 function SystemIdracVersion {
+	local OUT VALUE
+	OUT="$(OMSAValueOrEmpty chassis info)"
+	VALUE="$(echo "$OUT" | awk 'BEGIN{IGNORECASE=1} /^idrac/ {print $1,$4; exit}' | Trim)"
+	[ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
 
-IDRACVERSION="$($OMSABIN chassis info | grep -i ^idrac | awk '{print $1,$4}')"
+	VALUE="$(RedfishManagerValue FirmwareVersion)"
+	[ -n "$VALUE" ] && PrintValue "Redfish" "$VALUE" && return
 
-if [[ -z "$IDRACVERSION" ]]; then
-	IDRACVERSION="none"
-else
-	IDRACVERSION="$IDRACVERSION"
-fi
+	OUT="$(IPMIRun mc info)"
+	VALUE="$(echo "$OUT" | awk -F':' '/Firmware Revision/ {print $2; exit}' | Trim)"
+	[ -n "$VALUE" ] && PrintValue "ipmitool" "$VALUE" && return
 
-echo "$IDRACVERSION"
+	PrintValue "none" "none"
+}
 
+function SystemStatus {
+	local OUT VALUE
+	OUT="$(OMSAValueOrEmpty chassis)"
+	if [ -n "$OUT" ]; then
+		if echo "$OUT" | awk -F':' '
+			/SEVERITY/ {next}
+			/:/ {
+				status=$1
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", status)
+				if (tolower(status) != "ok") bad=1
+			}
+			END {exit bad ? 0 : 1}
+		'; then
+			PrintValue "OMSA" "Failure"
+		else
+			PrintValue "OMSA" "OK"
+		fi
+		return
+	fi
+
+	VALUE="$(RedfishSystemHealth)"
+	[ -n "$VALUE" ] && PrintValue "Redfish" "$VALUE" && return
+
+	if PerccliRun show | awk '$NF ~ /Opt/ {ok=1} END{exit ok?0:1}'; then
+		PrintValue "perccli" "OK"
+		return
+	fi
+
+	PrintValue "none" "Unknown"
+}
+
+function PhysicalDisksDiscoveryOMSA {
+	local CONTROLLERS CONTROLLER DISKS DISK RESULT JSON
+	CONTROLLERS="$(OMSARun storage controller | grep ^ID | awk '{print $3}')" || return 1
+	[ -n "$CONTROLLERS" ] || return 1
+	for CONTROLLER in $CONTROLLERS; do
+		DISKS="$(OMSARun storage pdisk controller="$CONTROLLER" | grep ^ID | awk '{print $3}')"
+		for DISK in $DISKS; do
+			RESULT+="$(printf '\n{\n\"{#PDISK}\": \"%s\",\n\"{#CONTROLLER}\": \"%s\"\n},' "$(echo "$DISK" | JsonEscape)" "$(echo "$CONTROLLER" | JsonEscape)")"
+		done
+	done
+	[ -n "$RESULT" ] || return 1
+	JSON="$(echo "$RESULT" | sed '$s/,$//')"
+	printf '{\n"data":[%s\n]}\n' "$JSON"
+}
+
+function PhysicalDisksDiscoveryPerccli {
+	local CONTROLLER OUT RESULT JSON LINE DISK
+	for CONTROLLER in $(PerccliControllers); do
+		OUT="$(PerccliRun /c"$CONTROLLER"/eall/sall show)" || continue
+		while IFS= read -r LINE; do
+			DISK="$(echo "$LINE" | awk '$1 ~ /^[0-9]+:[0-9]+$/ {print $1}')"
+			[ -n "$DISK" ] || continue
+			RESULT+="$(printf '\n{\n\"{#PDISK}\": \"%s\",\n\"{#CONTROLLER}\": \"%s\"\n},' "$(echo "$DISK" | JsonEscape)" "$(echo "$CONTROLLER" | JsonEscape)")"
+		done <<< "$OUT"
+	done
+	[ -n "$RESULT" ] || return 1
+	JSON="$(echo "$RESULT" | sed '$s/,$//')"
+	printf '{\n"data":[%s\n]}\n' "$JSON"
+}
+
+function PhysicalDisksDiscovery {
+	local OUT
+	OUT="$(PhysicalDisksDiscoveryOMSA)" && { [ "$SOURCE_ONLY" = "1" ] && echo "OMSA" || echo "$OUT"; SetSource "OMSA"; return; }
+	OUT="$(PhysicalDisksDiscoveryPerccli)" && { [ "$SOURCE_ONLY" = "1" ] && echo "perccli" || echo "$OUT"; SetSource "perccli"; return; }
+	[ "$SOURCE_ONLY" = "1" ] && echo "none" || EmptyLLD
+}
+
+function PhysicalDiskStatusOMSA {
+	local PDISK="$1"
+	local CONTROLLER="$2"
+	local ITEM="$3"
+	local OUT VALUE
+	OUT="$(OMSARun storage pdisk controller="$CONTROLLER" pdisk="$PDISK")" || return 1
+	[ -n "$OUT" ] || return 1
+	case "$ITEM" in
+		status)
+			VALUE="$(echo "$OUT" | awk '/^State/ {print $3; exit}')"
+			;;
+		pfailure)
+			VALUE="$(echo "$OUT" | awk '/^Failure Predicted/ {print $4; exit}')"
+			;;
+	esac
+	[ -n "$VALUE" ] || return 1
+	echo "$VALUE"
+}
+
+function PhysicalDiskStatusPerccli {
+	local PDISK="$1"
+	local CONTROLLER="$2"
+	local ITEM="$3"
+	local EID SLOT OUT LINE VALUE SMART PRED
+	EID="${PDISK%%:*}"
+	SLOT="${PDISK##*:}"
+	case "$ITEM" in
+		status)
+			OUT="$(PerccliRun /c"$CONTROLLER"/eall/sall show)" || return 1
+			LINE="$(echo "$OUT" | awk -v D="$PDISK" '$1==D {print; exit}')"
+			VALUE="$(echo "$LINE" | awk '{print $3}')"
+			[ -n "$VALUE" ] || return 1
+			NormalizePdState "$VALUE"
+			;;
+		pfailure)
+			OUT="$(PerccliRun /c"$CONTROLLER"/e"$EID"/s"$SLOT" show all)" || return 1
+			PRED="$(echo "$OUT" | awk -F'=' '/Predictive Failure Count/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+			SMART="$(echo "$OUT" | awk -F'=' '/S.M.A.R.T alert flagged by drive/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+			if [ "$SMART" = "Yes" ]; then
+				echo "Yes"
+			elif echo "$PRED" | grep -Eq '^[0-9]+$' && [ "$PRED" -gt 0 ]; then
+				echo "Yes"
+			else
+				echo "No"
+			fi
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+function PhysicalDiskStatus {
+	local VALUE
+	VALUE="$(PhysicalDiskStatusOMSA "$1" "$2" "$3")" && [ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
+	VALUE="$(PhysicalDiskStatusPerccli "$1" "$2" "$3")" && [ -n "$VALUE" ] && PrintValue "perccli" "$VALUE" && return
+	PrintValue "none" "Unknown"
+}
+
+function VirtualDiskDiscoveryOMSA {
+	local CONTROLLERS CONTROLLER VDISKS VDISK RESULT JSON
+	CONTROLLERS="$(OMSARun storage controller | grep ^ID | awk '{print $3}')" || return 1
+	[ -n "$CONTROLLERS" ] || return 1
+	for CONTROLLER in $CONTROLLERS; do
+		VDISKS="$(OMSARun storage vdisk controller="$CONTROLLER" | grep '^ID' | awk '{print $3}')"
+		for VDISK in $VDISKS; do
+			RESULT+="$(printf '\n{\n\"{#VDISK}\": \"%s\",\n\"{#CONTROLLER}\": \"%s\"\n},' "$(echo "$VDISK" | JsonEscape)" "$(echo "$CONTROLLER" | JsonEscape)")"
+		done
+	done
+	[ -n "$RESULT" ] || return 1
+	JSON="$(echo "$RESULT" | sed '$s/,$//')"
+	printf '{\n"data":[%s\n]}\n' "$JSON"
+}
+
+function VirtualDiskDiscoveryPerccli {
+	local CONTROLLER OUT RESULT JSON VDISK
+	for CONTROLLER in $(PerccliControllers); do
+		OUT="$(PerccliRun /c"$CONTROLLER"/vall show)" || continue
+		while IFS= read -r VDISK; do
+			[ -n "$VDISK" ] || continue
+			RESULT+="$(printf '\n{\n\"{#VDISK}\": \"%s\",\n\"{#CONTROLLER}\": \"%s\"\n},' "$(echo "$VDISK" | JsonEscape)" "$(echo "$CONTROLLER" | JsonEscape)")"
+		done <<< "$(echo "$OUT" | awk '$1 ~ /^[0-9]+\/[0-9]+$/ {print $1}')"
+	done
+	[ -n "$RESULT" ] || return 1
+	JSON="$(echo "$RESULT" | sed '$s/,$//')"
+	printf '{\n"data":[%s\n]}\n' "$JSON"
+}
+
+function VirtualDiskDiscovery {
+	local OUT
+	OUT="$(VirtualDiskDiscoveryOMSA)" && { [ "$SOURCE_ONLY" = "1" ] && echo "OMSA" || echo "$OUT"; SetSource "OMSA"; return; }
+	OUT="$(VirtualDiskDiscoveryPerccli)" && { [ "$SOURCE_ONLY" = "1" ] && echo "perccli" || echo "$OUT"; SetSource "perccli"; return; }
+	[ "$SOURCE_ONLY" = "1" ] && echo "none" || EmptyLLD
+}
+
+function VirtualDiskStatusOMSA {
+	local VDISK="$1"
+	local CONTROLLER="$2"
+	local ITEM="$3"
+	local OUT VALUE
+	OUT="$(OMSARun storage vdisk controller="$CONTROLLER" vdisk="$VDISK")" || return 1
+	[ -n "$OUT" ] || return 1
+	case "$ITEM" in
+		status)
+			VALUE="$(echo "$OUT" | awk '/^Status/ {print $3; exit}')"
+			VALUE="$(NormalizeHealth "$VALUE")"
+			;;
+		raid)
+			VALUE="$(echo "$OUT" | awk '/^Layout/ {print $3; exit}')"
+			;;
+		size)
+			VALUE="$(echo "$OUT" | awk -F'[()]' '/^Size/ && $2 ~ /bytes/ {gsub(/[^0-9]/, "", $2); print $2; exit}')"
+			if [ -z "$VALUE" ]; then
+				VALUE="$(echo "$OUT" | awk '/^Size/ {for(i=1;i<=NF;i++){if($i ~ /^[0-9,.]+$/){v=$i; u=$(i+1); gsub(/,/, "", v); print v " " u; exit}}}')"
+				if [ -n "$VALUE" ]; then
+					VALUE="$(SizeToBytes "$(echo "$VALUE" | awk '{print $1}')" "$(echo "$VALUE" | awk '{print $2}')")"
+				fi
+			fi
+			;;
+	esac
+	[ -n "$VALUE" ] || return 1
+	echo "$VALUE"
+}
+
+function VirtualDiskStatusPerccli {
+	local VDISK="$1"
+	local CONTROLLER="$2"
+	local ITEM="$3"
+	local OUT LINE VALUE UNIT
+	OUT="$(PerccliRun /c"$CONTROLLER"/vall show)" || return 1
+	LINE="$(echo "$OUT" | awk -v D="$VDISK" '$1==D {print; exit}')"
+	[ -n "$LINE" ] || return 1
+	case "$ITEM" in
+		status)
+			NormalizeHealth "$(echo "$LINE" | awk '{print $3}')"
+			;;
+		raid)
+			echo "$LINE" | awk '{print $2}'
+			;;
+		size)
+			VALUE="$(echo "$LINE" | awk '{print $9}')"
+			UNIT="$(echo "$LINE" | awk '{print $10}')"
+			[ -n "$VALUE" ] && [ -n "$UNIT" ] || return 1
+			SizeToBytes "$VALUE" "$UNIT"
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+function VirtualDiskStatus {
+	local VALUE
+	VALUE="$(VirtualDiskStatusOMSA "$1" "$2" "$3")" && [ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
+	VALUE="$(VirtualDiskStatusPerccli "$1" "$2" "$3")" && [ -n "$VALUE" ] && PrintValue "perccli" "$VALUE" && return
+	if [ "$3" = "size" ]; then
+		PrintNoData "none"
+		return 1
+	fi
+	PrintValue "none" "Unknown"
+}
+
+function FanDiscoveryOMSA {
+	local OUT FANS FAN RESULT JSON
+	OUT="$(OMSARun chassis fans)" || return 1
+	FANS="$(echo "$OUT" | grep ^Index | awk '{print $3}')"
+	[ -n "$FANS" ] || return 1
+	for FAN in $FANS; do
+		RESULT+="$(printf '\n{\n\"{#FAN}\": \"%s\"\n},' "$(echo "$FAN" | JsonEscape)")"
+	done
+	JSON="$(echo "$RESULT" | sed '$s/,$//')"
+	printf '{\n"data":[%s\n]}\n' "$JSON"
+}
+
+function FanDiscoveryIPMI {
+	local OUT RESULT JSON NAME
+	OUT="$(IPMISensorOutput)" || return 1
+	while IFS= read -r NAME; do
+		[ -n "$NAME" ] || continue
+		RESULT+="$(printf '\n{\n\"{#FAN}\": \"%s\"\n},' "$(echo "$NAME" | JsonEscape)")"
+	done <<< "$(echo "$OUT" | awk -F'|' 'tolower($1) ~ /fan/ && tolower($3) ~ /rpm/ {gsub(/^ *| *$/, "", $1); print $1}')"
+	[ -n "$RESULT" ] || return 1
+	JSON="$(echo "$RESULT" | sed '$s/,$//')"
+	printf '{\n"data":[%s\n]}\n' "$JSON"
+}
+
+function FanDiscovery {
+	local OUT
+	OUT="$(FanDiscoveryOMSA)" && { [ "$SOURCE_ONLY" = "1" ] && echo "OMSA" || echo "$OUT"; SetSource "OMSA"; return; }
+	OUT="$(FanDiscoveryIPMI)" && { [ "$SOURCE_ONLY" = "1" ] && echo "ipmitool" || echo "$OUT"; SetSource "ipmitool"; return; }
+	[ "$SOURCE_ONLY" = "1" ] && echo "none" || EmptyLLD
+}
+
+function FanStatusOMSA {
+	local FAN="$1"
+	local ITEM="$2"
+	local OUT VALUE
+	OUT="$(OMSARun chassis fans index="$FAN")" || return 1
+	[ -n "$OUT" ] || return 1
+	case "$ITEM" in
+		rpm)
+			VALUE="$(echo "$OUT" | awk '/^Reading/ {print $3; exit}')"
+			;;
+		status)
+			VALUE="$(echo "$OUT" | awk '/^Status/ {print $3; exit}')"
+			VALUE="$(NormalizeHealth "$VALUE")"
+			;;
+	esac
+	[ -n "$VALUE" ] || return 1
+	echo "$VALUE"
+}
+
+function FanStatusIPMI {
+	local FAN="$1"
+	local ITEM="$2"
+	local LINE VALUE
+	LINE="$(IPMISensorOutput | awk -F'|' -v F="$FAN" '{name=$1; gsub(/^ *| *$/, "", name); if(name==F){print; exit}}')" || return 1
+	[ -n "$LINE" ] || return 1
+	case "$ITEM" in
+		rpm)
+			VALUE="$(echo "$LINE" | awk -F'|' '{gsub(/^ *| *$/, "", $2); print $2}' | grep -Eo '^[0-9.]+')"
+			;;
+		status)
+			VALUE="$(echo "$LINE" | awk -F'|' '{gsub(/^ *| *$/, "", $4); print $4}')"
+			VALUE="$(NormalizeHealth "$VALUE")"
+			;;
+	esac
+	[ -n "$VALUE" ] || return 1
+	echo "$VALUE"
+}
+
+function FanStatus {
+	local VALUE
+	VALUE="$(FanStatusOMSA "$1" "$2")" && [ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
+	VALUE="$(FanStatusIPMI "$1" "$2")" && [ -n "$VALUE" ] && PrintValue "ipmitool" "$VALUE" && return
+	case "$2" in
+		rpm)
+			PrintValue "none" "0"
+			;;
+		*)
+			PrintValue "none" "Unknown"
+			;;
+	esac
+}
+
+function TempDiscoveryOMSA {
+	local OUT TEMPS TEMP INDEX PROBE RESULT JSON
+	OUT="$(OMSARun chassis temps)" || return 1
+	TEMPS="$(echo "$OUT" | grep "^Index\|^Probe Name" | cut -d':' -f2 | sed 's/^ //' | paste - -)"
+	[ -n "$TEMPS" ] || return 1
+	while IFS= read -r TEMP; do
+		INDEX="$(echo "$TEMP" | awk '{print $1}')"
+		PROBE="$(echo "$TEMP" | cut -d' ' -f2- | Trim)"
+		RESULT+="$(printf '\n{\n\"{#TEMP}\": \"%s\",\n\"{#TEMPINDEX}\": \"%s\"\n},' "$(echo "$PROBE" | JsonEscape)" "$(echo "$INDEX" | JsonEscape)")"
+	done <<< "$TEMPS"
+	JSON="$(echo "$RESULT" | sed '$s/,$//')"
+	printf '{\n"data":[%s\n]}\n' "$JSON"
+}
+
+function TempDiscoveryIPMI {
+	local OUT RESULT JSON NAME INDEX DISP
+	OUT="$(IPMISensorOutput)" || return 1
+	while IFS=$'\t' read -r NAME INDEX DISP; do
+		[ -n "$NAME" ] || continue
+		[ -n "$DISP" ] || DISP="$NAME"
+		RESULT+="$(printf '\n{\n\"{#TEMP}\": \"%s\",\n\"{#TEMPINDEX}\": \"%s\"\n},' "$(echo "$DISP" | JsonEscape)" "$(echo "$INDEX" | JsonEscape)")"
+	done <<< "$(echo "$OUT" | awk -F'|' '
+		BEGIN {n=0}
+		tolower($3) ~ /degrees c/ {
+			name=$1
+			gsub(/^ *| *$/, "", name)
+			base=name
+			count[base]++
+			disp=base
+			if (count[base] > 1) disp=base " " count[base]
+			printf "%s\tipmi:%d\t%s\n", name, n, disp
+			n++
+		}
+	')"
+	[ -n "$RESULT" ] || return 1
+	JSON="$(echo "$RESULT" | sed '$s/,$//')"
+	printf '{\n"data":[%s\n]}\n' "$JSON"
+}
+
+function TempDiscovery {
+	local OUT
+	OUT="$(TempDiscoveryOMSA)" && { [ "$SOURCE_ONLY" = "1" ] && echo "OMSA" || echo "$OUT"; SetSource "OMSA"; return; }
+	OUT="$(TempDiscoveryIPMI)" && { [ "$SOURCE_ONLY" = "1" ] && echo "ipmitool" || echo "$OUT"; SetSource "ipmitool"; return; }
+	[ "$SOURCE_ONLY" = "1" ] && echo "none" || EmptyLLD
+}
+
+function TempStatusOMSA {
+	local INDEX="$1"
+	local OUT VALUE
+	OUT="$(OMSARun chassis temps index="$INDEX")" || return 1
+	VALUE="$(echo "$OUT" | awk '/^Reading/ {print $3; exit}')"
+	[ -n "$VALUE" ] || return 1
+	echo "$VALUE"
+}
+
+function TempStatusIPMI {
+	local TEMP="$1"
+	local VALUE LINE TARGET_INDEX
+	if echo "$TEMP" | grep -Eq '^ipmi:[0-9]+$'; then
+		TARGET_INDEX="${TEMP#ipmi:}"
+		LINE="$(IPMISensorOutput | awk -F'|' -v IDX="$TARGET_INDEX" '
+			BEGIN {n=0}
+			tolower($3) ~ /degrees c/ {
+				val=$2
+				gsub(/^ *| *$/, "", val)
+				if (n==IDX) {print val; exit}
+				n++
+			}
+		')" || return 1
+		VALUE="$(echo "$LINE" | grep -Eo '^[0-9.]+')"
+	elif echo "$TEMP" | grep -Eq '^[0-9]+$'; then
+		TARGET_INDEX="$TEMP"
+		LINE="$(IPMISensorOutput | awk -F'|' -v IDX="$TARGET_INDEX" '
+			BEGIN {n=0}
+			tolower($3) ~ /degrees c/ {
+				val=$2
+				gsub(/^ *| *$/, "", val)
+				if (n==IDX || n+1==IDX) {print val; exit}
+				n++
+			}
+		')" || return 1
+		VALUE="$(echo "$LINE" | grep -Eo '^[0-9.]+')"
+	else
+		VALUE="$(IPMISensorOutput | awk -F'|' -v T="$TEMP" '{name=$1; gsub(/^ *| *$/, "", name); if(name==T){gsub(/^ *| *$/, "", $2); print $2; exit}}' | grep -Eo '^[0-9.]+')"
+	fi
+	[ -n "$VALUE" ] || return 1
+	echo "$VALUE"
+}
+
+function TempStatus {
+	local VALUE
+	VALUE="$(TempStatusOMSA "$1")" && [ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
+	VALUE="$(TempStatusIPMI "$1")" && [ -n "$VALUE" ] && PrintValue "ipmitool" "$VALUE" && return
+	# ZabbixのNumeric(float)アイテムをunsupportedにしないため、取得不可時は数値を返す
+	# 既定は -273 です。未対応/取得不可が一目で分かるようにしています。
+	PrintValue "none" "$TEMP_UNSUPPORTED_VALUE"
+}
+
+function PsuDiscoveryOMSA {
+	local OUT PSUS PSU RESULT JSON
+	OUT="$(OMSARun chassis pwrsupplies)" || return 1
+	PSUS="$(echo "$OUT" | grep ^Index | awk '{print $3}')"
+	[ -n "$PSUS" ] || return 1
+	for PSU in $PSUS; do
+		RESULT+="$(printf '\n{\n\"{#PSU}\": \"%s\"\n},' "$(echo "$PSU" | JsonEscape)")"
+	done
+	JSON="$(echo "$RESULT" | sed '$s/,$//')"
+	printf '{\n"data":[%s\n]}\n' "$JSON"
+}
+
+function PsuDiscoveryIPMI {
+	local OUT RESULT JSON NAME
+	OUT="$(IPMISensorOutput)" || return 1
+	while IFS= read -r NAME; do
+		[ -n "$NAME" ] || continue
+		RESULT+="$(printf '\n{\n\"{#PSU}\": \"%s\"\n},' "$(echo "$NAME" | JsonEscape)")"
+	done <<< "$(echo "$OUT" | awk -F'|' 'tolower($1) ~ /(ps|power)/ {gsub(/^ *| *$/, "", $1); print $1}')"
+	[ -n "$RESULT" ] || return 1
+	JSON="$(echo "$RESULT" | sed '$s/,$//')"
+	printf '{\n"data":[%s\n]}\n' "$JSON"
+}
+
+function PsuDiscovery {
+	local OUT
+	OUT="$(PsuDiscoveryOMSA)" && { [ "$SOURCE_ONLY" = "1" ] && echo "OMSA" || echo "$OUT"; SetSource "OMSA"; return; }
+	OUT="$(PsuDiscoveryIPMI)" && { [ "$SOURCE_ONLY" = "1" ] && echo "ipmitool" || echo "$OUT"; SetSource "ipmitool"; return; }
+	[ "$SOURCE_ONLY" = "1" ] && echo "none" || EmptyLLD
+}
+
+function PsuStatusOMSA {
+	local PSU="$1"
+	local VALUE
+	VALUE="$(OMSARun chassis pwrsupplies | grep -A1 "^Index.*$PSU" | tail -1 | awk '{print $3}')"
+	[ -n "$VALUE" ] || return 1
+	NormalizeHealth "$VALUE"
+}
+
+function PsuStatusIPMI {
+	local PSU="$1"
+	local VALUE
+	VALUE="$(IPMISensorOutput | awk -F'|' -v P="$PSU" '{name=$1; gsub(/^ *| *$/, "", name); if(name==P){gsub(/^ *| *$/, "", $4); print $4; exit}}')"
+	[ -n "$VALUE" ] || return 1
+	NormalizeHealth "$VALUE"
+}
+
+function PsuStatus {
+	local VALUE
+	VALUE="$(PsuStatusOMSA "$1")" && [ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
+	VALUE="$(PsuStatusIPMI "$1")" && [ -n "$VALUE" ] && PrintValue "ipmitool" "$VALUE" && return
+	PrintValue "none" "Unknown"
+}
+
+function RAMDiscovery {
+	local OUT RAMS RAM RESULT JSON
+	OUT="$(OMSARun chassis memory)"
+	RAMS="$(echo "$OUT" | grep "Index" | awk '{print $3}' | grep -Eo '[0-9]+')"
+	if [ -n "$RAMS" ]; then
+		for RAM in $RAMS; do
+			RESULT+="$(printf '\n{\n\"{#RAM}\": \"%s\"\n},' "$(echo "$RAM" | JsonEscape)")"
+		done
+		JSON="$(echo "$RESULT" | sed '$s/,$//')"
+		printf '{\n"data":[%s\n]}\n' "$JSON"
+		return
+	fi
+	EmptyLLD
+}
+
+function RAMStatus {
+	local RAM="$1"
+	local OUT VALUE
+	OUT="$(OMSARun chassis memory index="$RAM")" || true
+	VALUE="$(echo "$OUT" | awk '/^Status/ {print $3; exit}')"
+	[ -n "$VALUE" ] && PrintValue "OMSA" "$(NormalizeHealth "$VALUE")" && return
+	PrintValue "none" "Unsupported"
 }
 
 function PowerDiscovery {
-
-	OUT="$($OMSABIN chassis pwrmonitoring 2>/dev/null)"
-
-	# 非対応メッセージが出ている場合、空のLLDを返して終了
+	local OUT PWRS PWR INDEX PROBE RESULT JSON
+	OUT="$(OMSARun chassis pwrmonitoring 2>/dev/null)" || true
 	if echo "$OUT" | grep -q "Power Consumption Information is not available"; then
-		echo -e "{"
-		echo -e "\"data\":[]"
-		echo -e "}"
+		EmptyLLD
 		return
 	fi
-
-	# Index/Probe Nameが1つも無い場合も空LLD
-	if ! echo "$OUT" | grep -q "^Index"; then
-		echo -e "{"
-		echo -e "\"data\":[]"
-		echo -e "}"
+	PWRS="$(echo "$OUT" | grep "^Index\|^Probe Name" | cut -d':' -f2 | sed 's/^ //' | paste - -)"
+	if [ -n "$PWRS" ]; then
+		while IFS= read -r PWR; do
+			INDEX="$(echo "$PWR" | awk '{print $1}')"
+			PROBE="$(echo "$PWR" | cut -d' ' -f2- | Trim)"
+			RESULT+="$(printf '\n{\n\"{#PWRINDEX}\": \"%s\",\n\"{#PWRNAME}\": \"%s\"\n},' "$(echo "$INDEX" | JsonEscape)" "$(echo "$PROBE" | JsonEscape)")"
+		done <<< "$PWRS"
+		JSON="$(echo "$RESULT" | sed '$s/,$//')"
+		printf '{\n"data":[%s\n]}\n' "$JSON"
 		return
 	fi
-
-	# 対応している場合は全Index＋Probe NameをLLDとして返す
-	IFS=$'\n' read -r -d '' -a PWRS <<< "$(echo "$OUT" | grep "^Index\|^Probe Name" | cut -d':' -f2 | sed 's/^ //' | paste - -)"
-
-	for PWR in "${PWRS[@]}"
-	do
-		read -a PWR_SPLIT <<< "$PWR"
-
-		INDEX=${PWR_SPLIT[0]}
-		PROBE=${PWR_SPLIT[@]:1}
-
-		RESULT+=$(echo -e "\n{\n\"{#PWRINDEX}\": \"$INDEX\",\n\"{#PWRNAME}\": \"$PROBE\" \n},")
-	done
-
-	echo -e "{"
-	echo -e "\"data\":["
-
-	JSON=$(echo "$RESULT" | sed '$s/,$//')
-
-	echo "$JSON"
-	echo "]}"
+	EmptyLLD
 }
 
 function PowerStatus {
-
-	INDEX="$1"
-
-	OUT="$($OMSABIN chassis pwrmonitoring 2>/dev/null)"
-
-	STATUS="$(echo "$OUT" | awk -v IDX="$INDEX" '
-		/^Index/ {
-			# 行の最後のフィールドをIndexとして保持
-			cur_idx = $NF
-		}
-		/^Reading/ && $NF=="W" && cur_idx==IDX {
-			# Reading の行で、末尾が W かつ Index が一致した場合に数値を出力
-			print $(NF-1)
-			exit
-		}
+	local INDEX="$1"
+	local OUT VALUE
+	OUT="$(OMSARun chassis pwrmonitoring 2>/dev/null)" || true
+	VALUE="$(echo "$OUT" | awk -v IDX="$INDEX" '
+		/^Index/ {cur_idx=$NF}
+		/^Reading/ && $NF=="W" && cur_idx==IDX {print $(NF-1); exit}
 	')"
-
-	echo "$STATUS"
+	[ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
+	PrintValue "none" "Unknown"
 }
 
 function BmcInfo {
-
-	MODE="$1"
-
-	OUT="$($OMSABIN chassis bmc 2>/dev/null)"
-
-	# BMC/iDRAC が無い、または取得できない場合は何も返さず終了
-	if [ -z "$OUT" ] || ! echo "$OUT" | grep -q "Remote Access Device"; then
-		exit 0
+	local MODE="$1"
+	local OUT VALUE
+	OUT="$(OMSARun chassis bmc 2>/dev/null)" || true
+	if [ -n "$OUT" ] && echo "$OUT" | grep -q "Remote Access Device"; then
+		case "$MODE" in
+			device_type)
+				VALUE="$(echo "$OUT" | awk -F':' '/Device Type/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+				;;
+			ipmi_version)
+				VALUE="$(echo "$OUT" | awk -F':' '/IPMI Version/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+				;;
+			sessions_possible)
+				VALUE="$(echo "$OUT" | awk -F':' '/Number of Possible Active Sessions/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+				;;
+			sessions_active)
+				VALUE="$(echo "$OUT" | awk -F':' '/Number of Current Active Sessions/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+				;;
+			ipmi_over_lan)
+				VALUE="$(echo "$OUT" | awk -F':' '/Enable IPMI Over LAN/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+				;;
+			sol_enabled)
+				VALUE="$(echo "$OUT" | awk -F':' '/SOL Enabled/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+				;;
+			mac)
+				VALUE="$(echo "$OUT" | awk -F':' '/MAC Address/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+				;;
+			ipv4)
+				VALUE="$(echo "$OUT" | awk '/^IPv4 Address/ {in_block=1; next} in_block && NF==0 {in_block=0; next} in_block && $0 ~ /IP Address[[:space:]]*:/ {sub(/.*IP Address[[:space:]]*:[[:space:]]*/, "", $0); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0); print $0; exit}')"
+				;;
+			ipv4_source)
+				VALUE="$(echo "$OUT" | awk '/IP Address Source[[:space:]]*:/ {split($0,a,":"); gsub(/^ *| *$/, "", a[2]); print a[2]; exit}')"
+				;;
+			ipv4_subnet)
+				VALUE="$(echo "$OUT" | awk '/IP Subnet[[:space:]]*:/ {split($0,a,":"); gsub(/^ *| *$/, "", a[2]); print a[2]; exit}')"
+				;;
+			ipv4_gateway)
+				VALUE="$(echo "$OUT" | awk '/IP Gateway[[:space:]]*:/ {split($0,a,":"); gsub(/^ *| *$/, "", a[2]); print a[2]; exit}')"
+				;;
+		esac
+		[ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
 	fi
 
 	case "$MODE" in
 		device_type)
-			echo "$OUT" | awk -F':' '/Device Type/ { gsub(/^ *| *$/,"",$2); print $2; exit }'
+			PrintValue "none" "Unsupported"
 			;;
 		ipmi_version)
-			echo "$OUT" | awk -F':' '/IPMI Version/ { gsub(/^ *| *$/,"",$2); print $2; exit }'
-			;;
-		sessions_possible)
-			echo "$OUT" | awk -F':' '/Number of Possible Active Sessions/ { gsub(/^ *| *$/,"",$2); print $2; exit }'
-			;;
-		sessions_active)
-			echo "$OUT" | awk -F':' '/Number of Current Active Sessions/ { gsub(/^ *| *$/,"",$2); print $2; exit }'
-			;;
-		ipmi_over_lan)
-			echo "$OUT" | awk -F':' '/Enable IPMI Over LAN/ { gsub(/^ *| *$/,"",$2); print $2; exit }'
-			;;
-		sol_enabled)
-			echo "$OUT" | awk -F':' '/SOL Enabled/ { gsub(/^ *| *$/,"",$2); print $2; exit }'
+			VALUE="$(IPMIRun mc info | awk -F':' '/IPMI Version/ {print $2; exit}' | Trim)"
+			[ -n "$VALUE" ] && PrintValue "ipmitool" "$VALUE" || PrintValue "none" "Unknown"
 			;;
 		mac)
-			echo "$OUT" | awk -F':' '/MAC Address/ { gsub(/^ *| *$/,"",$2); print $2; exit }'
+			VALUE="$(RedfishServiceRootValue ManagerMACAddress)"
+			[ -n "$VALUE" ] && PrintValue "Redfish" "$VALUE" || PrintValue "none" "Unknown"
 			;;
-		ipv4)
-			echo "$OUT" | awk '
-				/^IPv4 Address/ { in_block=1; next }
-				in_block && NF==0 { in_block=0; next }
-				in_block && $0 ~ /IP Address[[:space:]]*:/ {
-					sub(/.*IP Address[[:space:]]*:[[:space:]]*/, "", $0);
-					gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0);
-					print $0;
-					exit
-				}
-			'
-			;;
-		ipv4_source)
-			echo "$OUT" | awk -v RS="" '
-				/IPv4 Address/ {
-					while (getline line) {
-						if (line ~ /^IPv6 Address/) break
-						if (line ~ /IP Address Source[[:space:]]*:/) {
-							n = split(line, a, ":")
-							if (n > 1) {
-								gsub(/^ *| *$/, "", a[2])
-								print a[2]
-								exit
-							}
-						}
-					}
-				}
-			'
-			;;
-		ipv4_subnet)
-			echo "$OUT" | awk -v RS="" '
-				/IPv4 Address/ {
-					while (getline line) {
-						if (line ~ /^IPv6 Address/) break
-						if (line ~ /IP Subnet[[:space:]]*:/) {
-							n = split(line, a, ":")
-							if (n > 1) {
-								gsub(/^ *| *$/, "", a[2])
-								print a[2]
-								exit
-							}
-						}
-					}
-				}
-			'
-			;;
-		ipv4_gateway)
-			echo "$OUT" | awk -v RS="" '
-				/IPv4 Address/ {
-					while (getline line) {
-						if (line ~ /^IPv6 Address/) break
-						if (line ~ /IP Gateway[[:space:]]*:/) {
-							n = split(line, a, ":")
-							if (n > 1) {
-								gsub(/^ *| *$/, "", a[2])
-								print a[2]
-								exit
-							}
-						}
-					}
-				}
-			'
+		*)
+			PrintValue "none" "Unsupported"
 			;;
 	esac
 }
 
-function CmosBatteryStatus {
-	OUT="$($OMSABIN chassis batteries 2>/dev/null)"
+function BatteriesDiscoveryOMSA {
+	local OUT RESULT JSON CUR_INDEX PROBE IN_SECTION LINE
+	OUT="$(OMSARun chassis batteries 2>/dev/null)" || return 1
+	[ -n "$OUT" ] && echo "$OUT" | grep -q "^Batteries" || return 1
+	echo "$OUT" | grep -q "^Individual Battery Elements" || return 1
+	IN_SECTION=0
+	while IFS= read -r LINE; do
+		if echo "$LINE" | grep -q "^Individual Battery Elements"; then
+			IN_SECTION=1
+			continue
+		fi
+		[ "$IN_SECTION" -eq 1 ] || continue
+		if echo "$LINE" | grep -q "^Index"; then
+			CUR_INDEX="$(echo "$LINE" | awk '{print $3}')"
+			continue
+		fi
+		if echo "$LINE" | grep -q "^Probe Name"; then
+			PROBE="$(echo "$LINE" | cut -d':' -f2- | Trim)"
+			RESULT+="$(printf '\n{\n\"{#BATTINDEX}\": \"%s\",\n\"{#BATTPROBE}\": \"%s\"\n},' "$(echo "$CUR_INDEX" | JsonEscape)" "$(echo "$PROBE" | JsonEscape)")"
+		fi
+	done <<< "$OUT"
+	[ -n "$RESULT" ] || return 1
+	JSON="$(echo "$RESULT" | sed '$s/,$//')"
+	printf '{\n"data":[%s\n]}\n' "$JSON"
+}
 
-	# 出力が無い、または"Batteries"セクションが無ければ何も返さず終了
-	if [ -z "$OUT" ] || ! echo "$OUT" | grep -q "^Batteries"; then
-		exit 0
-	fi
-
-	STATUS="$(echo "$OUT" | awk '
-		/^Index/ { idx=$3 }
-		/^Probe Name[[:space:]]*:[[:space:]]*System Board CMOS Battery/ { target=idx }
-		/^Reading/ && target==idx { print $3; exit }
-	')"
-
-	# STATUS が空なら何も出さず終了
-	[ -z "$STATUS" ] && exit 0
-
-	echo "$STATUS"
+function BatteriesDiscoveryPerccli {
+	local CONTROLLER OUT RESULT JSON
+	for CONTROLLER in $(PerccliControllers); do
+		OUT="$(PerccliRun /c"$CONTROLLER"/bbu show all)" || true
+		if echo "$OUT" | grep -q "Status = Success"; then
+			RESULT+="$(printf '\n{\n\"{#BATTINDEX}\": \"c%s-bbu\",\n\"{#BATTPROBE}\": \"PERC BBU c%s\"\n},' "$CONTROLLER" "$CONTROLLER")"
+			continue
+		fi
+		OUT="$(PerccliRun /c"$CONTROLLER"/cv show all)" || true
+		if echo "$OUT" | grep -q "Status = Success"; then
+			RESULT+="$(printf '\n{\n\"{#BATTINDEX}\": \"c%s-cv\",\n\"{#BATTPROBE}\": \"PERC CacheVault c%s\"\n},' "$CONTROLLER" "$CONTROLLER")"
+		fi
+	done
+	[ -n "$RESULT" ] || return 1
+	JSON="$(echo "$RESULT" | sed '$s/,$//')"
+	printf '{\n"data":[%s\n]}\n' "$JSON"
 }
 
 function BatteriesDiscovery {
-	OUT="$($OMSABIN chassis batteries 2>/dev/null)"
+	local OUT
+	OUT="$(BatteriesDiscoveryOMSA)" && { [ "$SOURCE_ONLY" = "1" ] && echo "OMSA" || echo "$OUT"; SetSource "OMSA"; return; }
+	OUT="$(BatteriesDiscoveryPerccli)" && { [ "$SOURCE_ONLY" = "1" ] && echo "perccli" || echo "$OUT"; SetSource "perccli"; return; }
+	[ "$SOURCE_ONLY" = "1" ] && echo "none" || EmptyLLD
+}
 
-	# 出力が無い、または "Batteries" セクションが無い場合は空LLD
-	if [ -z "$OUT" ] || ! echo "$OUT" | grep -q "^Batteries"; then
-		echo -e "{"
-		echo -e "\"data\":[]"
-		echo -e "}"
-		return
+function BatteriesStatusOMSA {
+	local INDEX="$1"
+	local FIELD="$2"
+	local OUT VALUE CUR LINE
+	OUT="$(OMSARun chassis batteries 2>/dev/null)" || return 1
+	[ -n "$OUT" ] && echo "$OUT" | grep -q "^Batteries" || return 1
+	if [ "$FIELD" = "health" ]; then
+		VALUE="$(echo "$OUT" | awk -F':' '/^Health/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+		[ -n "$VALUE" ] && echo "$VALUE" && return 0
 	fi
-
-	# Individual Battery Elements が無い場合も空LLD
-	if ! echo "$OUT" | grep -q "^Individual Battery Elements"; then
-		echo -e "{"
-		echo -e "\"data\":[]"
-		echo -e "}"
-		return
-	fi
-
-	RESULT=""
-	in_section=0
-	CUR_INDEX=""
-
-	while IFS= read -r line; do
-
-		# 個別バッテリー要素セクション開始
-		if echo "$line" | grep -q "^Individual Battery Elements"; then
-			in_section=1
+	while IFS= read -r LINE; do
+		if echo "$LINE" | grep -q "^Index"; then
+			CUR="$(echo "$LINE" | awk '{print $3}')"
 			continue
 		fi
-
-		# セクション外は無視
-		[ "$in_section" -eq 1 ] || continue
-
-		# Index行
-		if echo "$line" | grep -q "^Index"; then
-            # "Index      : 0" の3番目のフィールドを取る
-			CUR_INDEX=$(echo "$line" | awk '{print $3}')
-			continue
-		fi
-
-		# Probe Name行
-		if echo "$line" | grep -q "^Probe Name"; then
-            # コロン以降を取り、前後の空白を削る
-			PROBE=$(echo "$line" | cut -d':' -f2- | sed 's/^ *//;s/ *$//')
-			RESULT+=$(echo -e "\n{\n\"{#BATTINDEX}\": \"$CUR_INDEX\",\n\"{#BATTPROBE}\": \"$PROBE\" \n},")
-		fi
-
+		[ "$CUR" = "$INDEX" ] || continue
+		case "$FIELD" in
+			status)
+				echo "$LINE" | grep -q "^Status[[:space:]]*:" && echo "$LINE" | awk -F':' '{gsub(/^ *| *$/, "", $2); print $2; exit}' && return 0
+				;;
+			reading)
+				echo "$LINE" | grep -q "^Reading[[:space:]]*:" && echo "$LINE" | awk -F':' '{gsub(/^ *| *$/, "", $2); print $2; exit}' && return 0
+				;;
+			probe)
+				echo "$LINE" | grep -q "^Probe Name[[:space:]]*:" && echo "$LINE" | awk -F':' '{gsub(/^ *| *$/, "", $2); print $2; exit}' && return 0
+				;;
+		esac
 	done <<< "$OUT"
+	return 1
+}
 
-	echo -e "{"
-	echo -e "\"data\":["
-	JSON=$(echo "$RESULT" | sed '$s/,$//')
-	echo "$JSON"
-	echo "]}"
+function BatteriesStatusPerccli {
+	local INDEX="$1"
+	local FIELD="$2"
+	local CONTROLLER TYPE OUT VALUE
+	if echo "$INDEX" | grep -q '^c[0-9][0-9]*-bbu$'; then
+		CONTROLLER="${INDEX#c}"
+		CONTROLLER="${CONTROLLER%-bbu}"
+		TYPE="bbu"
+	elif echo "$INDEX" | grep -q '^c[0-9][0-9]*-cv$'; then
+		CONTROLLER="${INDEX#c}"
+		CONTROLLER="${CONTROLLER%-cv}"
+		TYPE="cv"
+	elif [ "$INDEX" = "0" ]; then
+		CONTROLLER="0"
+		TYPE="bbu"
+	else
+		return 1
+	fi
+	OUT="$(PerccliRun /c"$CONTROLLER"/"$TYPE" show all)" || return 1
+	echo "$OUT" | grep -q "Status = Success" || return 1
+	case "$FIELD" in
+		health|status)
+			VALUE="$(echo "$OUT" | awk -F' ' '/Battery State/ {print $3; exit}')"
+			[ -n "$VALUE" ] || VALUE="$(echo "$OUT" | awk -F':' '/Status/ {print $2; exit}' | Trim)"
+			NormalizeHealth "$VALUE"
+			;;
+		reading)
+			VALUE="$(echo "$OUT" | awk -F' ' '/Battery State/ {print $3; exit}')"
+			[ -n "$VALUE" ] && echo "$VALUE" || echo "Unknown"
+			;;
+		probe)
+			echo "PERC ${TYPE^^} c${CONTROLLER}"
+			;;
+		*)
+			return 1
+			;;
+	esac
 }
 
 function BatteriesStatus {
+	local VALUE
+	VALUE="$(BatteriesStatusOMSA "$1" "$2")" && [ -n "$VALUE" ] && { case "$2" in health|status) VALUE="$(NormalizeHealth "$VALUE")" ;; esac; PrintValue "OMSA" "$VALUE"; return; }
+	VALUE="$(BatteriesStatusPerccli "$1" "$2")" && [ -n "$VALUE" ] && PrintValue "perccli" "$VALUE" && return
+	PrintValue "none" "Unsupported"
+}
 
-	INDEX="$1"
-	FIELD="$2"
+function CmosBatteryStatus {
+	local OUT VALUE
+	OUT="$(OMSARun chassis batteries 2>/dev/null)" || true
+	VALUE="$(echo "$OUT" | awk '
+		/^Index/ {idx=$3}
+		/^Probe Name[[:space:]]*:[[:space:]]*System Board CMOS Battery/ {target=idx}
+		/^Reading/ && target==idx {print $3; exit}
+	')"
+	[ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
+	PrintValue "none" "Unsupported"
+}
 
-	OUT="$($OMSABIN chassis batteries 2>/dev/null)"
 
-	# 出力が無い場合
-	if [ -z "$OUT" ] || ! echo "$OUT" | grep -q "^Batteries"; then
-		exit 0
+function DetectOSFamily {
+	local ID_LIKE_SAFE="" ID_SAFE=""
+	if [ -r /etc/os-release ]; then
+		. /etc/os-release
+		ID_SAFE="${ID:-}"
+		ID_LIKE_SAFE="${ID_LIKE:-}"
+	fi
+	case "$ID_SAFE" in
+		ubuntu|debian)
+			echo "debian"
+			return 0
+			;;
+		centos|rhel|almalinux|rocky|fedora|ol)
+			echo "rhel"
+			return 0
+			;;
+	esac
+	case "$ID_LIKE_SAFE" in
+		*debian*)
+			echo "debian"
+			return 0
+			;;
+		*rhel*|*fedora*)
+			echo "rhel"
+			return 0
+			;;
+	esac
+	if IsCommand apt; then
+		echo "debian"
+		return 0
+	fi
+	if IsCommand dnf || IsCommand yum; then
+		echo "rhel"
+		return 0
+	fi
+	return 1
+}
+
+function DetectPackageTool {
+	local FAMILY ID_SAFE="" VERSION_ID_SAFE="" MAJOR=""
+	FAMILY="${1:-$(DetectOSFamily 2>/dev/null)}"
+	if [ -r /etc/os-release ]; then
+		. /etc/os-release
+		ID_SAFE="${ID:-}"
+		VERSION_ID_SAFE="${VERSION_ID:-}"
+	fi
+	case "$FAMILY" in
+		debian)
+			echo "apt"
+			return 0
+			;;
+		rhel)
+			MAJOR="${VERSION_ID_SAFE%%.*}"
+			if [ "$ID_SAFE" = "centos" ] && [ "$MAJOR" = "7" ] && IsCommand yum; then
+				echo "yum"
+				return 0
+			fi
+			if IsCommand dnf; then
+				echo "dnf"
+				return 0
+			fi
+			if IsCommand yum; then
+				echo "yum"
+				return 0
+			fi
+			;;
+	esac
+	return 1
+}
+
+function PrintInstallCommands {
+	local FAMILY TOOL
+	FAMILY="$(DetectOSFamily)" || { echo "	OSを判定できませんでした。Ubuntu/Debian系、CentOS7、AlmaLinux/RHEL/Rocky 8以降等で実行してください。"; return 1; }
+	TOOL="$(DetectPackageTool "$FAMILY")" || { echo "	パッケージ管理コマンドを判定できませんでした。"; return 1; }
+	case "$TOOL" in
+		apt)
+			cat <<'EOF'
+	apt update
+	apt -y install dmidecode ipmitool openipmi curl
+	systemctl enable --now openipmi
+	modprobe ipmi_msghandler
+	modprobe ipmi_devintf
+	modprobe ipmi_si
+EOF
+			;;
+		yum)
+			cat <<'EOF'
+	yum -y install dmidecode ipmitool OpenIPMI curl
+	systemctl enable --now ipmi
+	modprobe ipmi_msghandler
+	modprobe ipmi_devintf
+	modprobe ipmi_si
+EOF
+			;;
+		dnf)
+			cat <<'EOF'
+	dnf -y install dmidecode ipmitool OpenIPMI curl
+	systemctl enable --now ipmi
+	modprobe ipmi_msghandler
+	modprobe ipmi_devintf
+	modprobe ipmi_si
+EOF
+			;;
+	esac
+}
+
+function InstallPackages {
+	local FAMILY TOOL
+	if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+		echo "パッケージをインストールするため、rootユーザーで実行してください。" >&2
+		return 1
+	fi
+	FAMILY="$(DetectOSFamily)" || { echo "OSを判定できませんでした。Ubuntu/Debian系、CentOS7、AlmaLinux/RHEL/Rocky 8以降等で実行してください。" >&2; return 1; }
+	TOOL="$(DetectPackageTool "$FAMILY")" || { echo "パッケージ管理コマンドを判定できませんでした。" >&2; return 1; }
+	case "$TOOL" in
+		apt)
+			apt update
+			apt -y install dmidecode ipmitool openipmi curl
+			systemctl enable --now openipmi || true
+			;;
+		yum)
+			yum -y install dmidecode ipmitool OpenIPMI curl
+			systemctl enable --now ipmi || systemctl enable --now openipmi || true
+			;;
+		dnf)
+			dnf -y install dmidecode ipmitool OpenIPMI curl
+			systemctl enable --now ipmi || systemctl enable --now openipmi || true
+			;;
+	esac
+	modprobe ipmi_msghandler || true
+	modprobe ipmi_devintf || true
+	modprobe ipmi_si || true
+	echo "必要パッケージのインストール処理が完了しました。perccliはDell配布ファイルから別途導入してください。"
+}
+
+function CurlConfigEscape {
+	sed 's/\\/\\\\/g;s/"/\\"/g'
+}
+
+function CreateRedfishConfig {
+	local CONF DIR DEFAULT_BASE INPUT_BASE USERNAME PASSWORD ESC_USER ESC_PASS ANSWER OWNER_ARGS
+	CONF="$REDFISH_CONFIG"
+	DIR="$(dirname "$CONF")"
+	LoadRedfishBaseFromConfig
+	DEFAULT_BASE="$REDFISH_BASE"
+
+	if [ -f "$CONF" ]; then
+		printf '既に%sが存在します。\n上書きしますか？ [y/N]: ' "$CONF" >&2
+		read -r ANSWER
+		case "$ANSWER" in
+			y|Y|yes|YES)
+				;;
+			*)
+				echo "作成を中止しました。"
+				return 1
+				;;
+		esac
 	fi
 
-	# ▼ 全体Health
-	if [ "$FIELD" = "health" ]; then
-		echo "$OUT" | grep "^Health" | awk -F':' '{gsub(/^ *| *$/, "", $2); print $2}'
-		exit 0
+	printf 'Redfish接続先 [%s]: ' "$DEFAULT_BASE" >&2
+	read -r INPUT_BASE
+	[ -n "$INPUT_BASE" ] && REDFISH_BASE="$INPUT_BASE"
+
+	printf 'Redfishユーザー名: ' >&2
+	read -r USERNAME
+	printf 'Redfishパスワード: ' >&2
+	read -rs PASSWORD
+	printf '
+' >&2
+
+	if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+		echo "ユーザー名またはパスワードが空のため作成を中止しました。" >&2
+		return 1
 	fi
 
-	# ▼ 個別Indexの処理
-	CUR=""
-	FOUND=""
+	ESC_USER="$(printf '%s' "$USERNAME" | CurlConfigEscape)"
+	ESC_PASS="$(printf '%s' "$PASSWORD" | CurlConfigEscape)"
 
-	while IFS= read -r line; do
+	if [ "${EUID:-$(id -u)}" -eq 0 ] && id zabbix >/dev/null 2>&1; then
+		install -o zabbix -g zabbix -m 700 -d "$DIR"
+		OWNER_ARGS="zabbix:zabbix"
+	else
+		mkdir -p "$DIR"
+		chmod 700 "$DIR"
+		OWNER_ARGS=""
+	fi
 
-		if echo "$line" | grep -q "^Index"; then
-			CUR=$(echo "$line" | awk '{print $3}')
-			continue
+	cat > "$CONF" <<EOF
+# REDFISH_BASE="${REDFISH_BASE}"
+# 上記の接続先はこのスクリプトが読み込みます。
+# curl自体はURLをコマンド引数から受け取ります。
+insecure
+silent
+show-error
+connect-timeout = 12
+max-time = 12
+user = "${ESC_USER}:${ESC_PASS}"
+EOF
+	chmod 600 "$CONF"
+	[ -n "$OWNER_ARGS" ] && chown "$OWNER_ARGS" "$CONF"
+	echo "Redfish設定ファイルを作成しました: $CONF"
+	echo "接続先は環境変数REDFISH_BASEで変更できます。"
+	echo "現在の想定接続先: $REDFISH_BASE"
+}
+
+function TestOMSA {
+	if OMSAUsable; then
+		echo "OMSA: OK"
+	else
+		echo "OMSA: Unsupported"
+	fi
+}
+
+function TestDmidecode {
+	IsCommand dmidecode && echo "dmidecode: OK" || echo "dmidecode: Unsupported"
+}
+
+function TestLocal {
+	TestDmidecode
+	if IPMIRun mc info >/dev/null 2>&1; then
+		echo "ipmitool -I open: OK"
+	else
+		echo "ipmitool -I open: Unsupported"
+	fi
+	TestPerccli
+}
+
+function TestIPMI {
+	if IPMIRun mc info >/dev/null 2>&1; then
+		echo "ipmitool -I open: OK"
+	else
+		echo "ipmitool -I open: Unsupported"
+	fi
+}
+
+function TestPerccli {
+	local BIN
+	BIN="$(FindPerccli)" || { echo "perccli: Unsupported"; return; }
+	if PerccliRun show >/dev/null 2>&1; then
+		echo "perccli: OK ($BIN)"
+	else
+		echo "perccli: Failed ($BIN)"
+	fi
+}
+
+function TestRedfish {
+	if ! RedfishAvailable; then
+		echo "Redfish: Unsupported"
+		return
+	fi
+	if RedfishGet /redfish/v1/ >/dev/null 2>&1; then
+		echo "Redfish: OK"
+	else
+		echo "Redfish: Failed"
+	fi
+}
+
+function BackendStatus {
+	TestOMSA
+	TestDmidecode
+	TestIPMI
+	TestPerccli
+	TestRedfish
+}
+
+function JoinArgs {
+	local OUT=""
+	while [ "$#" -gt 0 ]; do
+		if [ -z "$OUT" ]; then
+			OUT="$1"
+		else
+			OUT="$OUT $1"
 		fi
+		shift
+	done
+	printf '%s' "$OUT"
+}
 
-		# 対象Indexのみに絞る
-		if [ "$CUR" = "$INDEX" ]; then
+function DispatchFanStatus {
+	local COUNT ITEM FAN_PARTS FAN
+	COUNT="$#"
+	[ "$COUNT" -ge 2 ] || { PrintValue "none" "Unknown"; return; }
+	ITEM="${!COUNT}"
+	FAN_PARTS=$((COUNT - 1))
+	FAN="$(JoinArgs "${@:1:$FAN_PARTS}")"
+	FanStatus "$FAN" "$ITEM"
+}
 
-			if [ "$FIELD" = "status" ] && echo "$line" | grep -q "^Status[[:space:]]*:"; then
-				echo "$line" | awk -F':' '{gsub(/^ *| *$/, "", $2); print $2}'
-				exit 0
-			fi
+function DispatchTempStatus {
+	local TEMP
+	TEMP="$(JoinArgs "$@")"
+	TempStatus "$TEMP"
+}
 
-			if [ "$FIELD" = "reading" ] && echo "$line" | grep -q "^Reading[[:space:]]*:"; then
-				echo "$line" | awk -F':' '{gsub(/^ *| *$/, "", $2); print $2}'
-				exit 0
-			fi
-
-			if [ "$FIELD" = "probe" ] && echo "$line" | grep -q "^Probe Name[[:space:]]*:"; then
-				echo "$line" | awk -F':' '{gsub(/^ *| *$/, "", $2); print $2}'
-				exit 0
-			fi
-
-		fi
-
-	done <<< "$OUT"
+function DispatchPsuStatus {
+	local PSU
+	PSU="$(JoinArgs "$@")"
+	PsuStatus "$PSU"
 }
 
 function HandleArgs {
 	case "$1" in
+		--help|-h)
+			PrintHelp
+			;;
+		--backend-status)
+			BackendStatus
+			;;
+		--test-omsa)
+			TestOMSA
+			;;
+		--test-local)
+			TestLocal
+			;;
+		--test-ipmi)
+			TestIPMI
+			;;
+		--test-perccli)
+			TestPerccli
+			;;
+		--test-redfish)
+			TestRedfish
+			;;
+		--install-packages)
+			InstallPackages
+			;;
+		--create-redfish-conf)
+			CreateRedfishConfig
+			;;
+		--debug)
+			DEBUG="1"
+			shift
+			HandleArgs "$@"
+			;;
+		--source)
+			SOURCE_ONLY="1"
+			shift
+			HandleArgs "$@"
+			;;
 		pddiscovery)
 			PhysicalDisksDiscovery
 			;;
 		pdstatus)
-			PhysicalDiskStatus $2 $3 $4
+			PhysicalDiskStatus "$2" "$3" "$4"
 			;;
 		vddiscovery)
 			VirtualDiskDiscovery
 			;;
 		vdstatus)
-			VirtualDiskStatus $2 $3 $4
+			VirtualDiskStatus "$2" "$3" "$4"
 			;;
 		fandiscovery)
 			FanDiscovery
 			;;
 		fanstatus)
-			FanStatus $2 $3
+			shift
+			DispatchFanStatus "$@"
 			;;
 		psudiscovery)
 			PsuDiscovery
 			;;
 		psustatus)
-			PsuStatus $2
+			shift
+			DispatchPsuStatus "$@"
 			;;
 		ramdiscovery)
 			RAMDiscovery
 			;;
 		ramstatus)
-			RAMStatus $2
+			RAMStatus "$2"
 			;;
 		tempdiscovery)
 			TempDiscovery
 			;;
 		tempstatus)
-			TempStatus $2
+			shift
+			DispatchTempStatus "$@"
 			;;
 		model)
 			SystemModel
@@ -617,15 +1621,15 @@ function HandleArgs {
 			;;
 		status)
 			SystemStatus
-			;;		
+			;;
 		pwrdiscovery)
 			PowerDiscovery
 			;;
 		pwrstatus)
-			PowerStatus $2
+			PowerStatus "$2"
 			;;
 		bmc)
-			BmcInfo $2
+			BmcInfo "$2"
 			;;
 		cmos)
 			CmosBatteryStatus
@@ -634,9 +1638,13 @@ function HandleArgs {
 			BatteriesDiscovery
 			;;
 		battstatus)
-			BatteriesStatus $2 $3
+			BatteriesStatus "$2" "$3"
+			;;
+		*)
+			PrintHelp
+			exit 1
 			;;
 	esac
 }
 
-HandleArgs $@
+HandleArgs "$@"
