@@ -5,7 +5,7 @@
 
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_UID="$(id -u 2>/dev/null || echo unknown)"
 
@@ -635,6 +635,39 @@ function RedfishSystemHealth {
 	NormalizeHealth "$HEALTH"
 }
 
+function JsonObjectLines {
+	# 簡易JSONパーサーです。
+	# Dell Redfishやperccliのような監視用途のJSONから、配列内の各オブジェクトを1行化します。
+	tr '\n' ' ' | sed 's/}[[:space:]]*,[[:space:]]*{/}\
+{/g'
+}
+
+function JsonStringValueFromLine {
+	local LINE="$1"
+	local KEY="$2"
+	printf '%s\n' "$LINE" | JsonStringValue "$KEY"
+}
+
+function JsonNumberValueFromLine {
+	local LINE="$1"
+	local KEY="$2"
+	printf '%s\n' "$LINE" | JsonNumberValue "$KEY"
+}
+
+function RedfishThermalOutput {
+	local OUT
+	OUT="$(RedfishGet /redfish/v1/Chassis/System.Embedded.1/Thermal)" || return 1
+	[ -n "$OUT" ] || return 1
+	printf '%s\n' "$OUT"
+}
+
+function RedfishPowerOutput {
+	local OUT
+	OUT="$(RedfishGet /redfish/v1/Chassis/System.Embedded.1/Power)" || return 1
+	[ -n "$OUT" ] || return 1
+	printf '%s\n' "$OUT"
+}
+
 function SystemModel {
 	local OUT VALUE
 	OUT="$(OMSAValueOrEmpty chassis info)"
@@ -1013,15 +1046,24 @@ function FanStatus {
 }
 
 function TempDiscoveryOMSA {
-	local OUT TEMPS TEMP INDEX PROBE RESULT JSON
+	local OUT LINE INDEX PROBE RESULT JSON
 	OUT="$(OMSARun chassis temps)" || return 1
-	TEMPS="$(echo "$OUT" | grep "^Index\|^Probe Name" | cut -d':' -f2 | sed 's/^ //' | paste - -)"
-	[ -n "$TEMPS" ] || return 1
-	while IFS= read -r TEMP; do
-		INDEX="$(echo "$TEMP" | awk '{print $1}')"
-		PROBE="$(echo "$TEMP" | cut -d' ' -f2- | Trim)"
-		RESULT+="$(printf '\n{\n\"{#TEMP}\": \"%s\",\n\"{#TEMPINDEX}\": \"%s\"\n},' "$(echo "$PROBE" | JsonEscape)" "$(echo "$INDEX" | JsonEscape)")"
-	done <<< "$TEMPS"
+	while IFS= read -r LINE; do
+		case "$LINE" in
+			Index*)
+				INDEX="$(printf '%s\n' "$LINE" | cut -d':' -f2- | Trim)"
+				;;
+			"Probe Name"*)
+				PROBE="$(printf '%s\n' "$LINE" | cut -d':' -f2- | Trim)"
+				if [ -n "$INDEX" ] && [ -n "$PROBE" ]; then
+					RESULT+="$(printf '\n{\n\"{#TEMP}\": \"%s\",\n\"{#TEMPINDEX}\": \"%s\"\n},' "$(echo "$PROBE" | JsonEscape)" "$(echo "$INDEX" | JsonEscape)")"
+					INDEX=""
+					PROBE=""
+				fi
+				;;
+		esac
+	done <<< "$OUT"
+	[ -n "$RESULT" ] || return 1
 	JSON="$(echo "$RESULT" | sed '$s/,$//')"
 	printf '{\n"data":[%s\n]}\n' "$JSON"
 }
@@ -1034,14 +1076,23 @@ function TempDiscoveryIPMI {
 		[ -n "$DISP" ] || DISP="$NAME"
 		RESULT+="$(printf '\n{\n\"{#TEMP}\": \"%s\",\n\"{#TEMPINDEX}\": \"%s\"\n},' "$(echo "$DISP" | JsonEscape)" "$(echo "$INDEX" | JsonEscape)")"
 	done <<< "$(echo "$OUT" | awk -F'|' '
+		function trim(s) {
+			gsub(/^ *| *$/, "", s)
+			return s
+		}
+		function ipmi_temp_display_name(raw) {
+			if (raw == "Inlet Temp") return "System Board Inlet Temp"
+			if (raw == "Exhaust Temp") return "System Board Exhaust Temp"
+			if (raw == "Temp") {
+				cpu_temp_count++
+				return "CPU" cpu_temp_count " Temp"
+			}
+			return raw
+		}
 		BEGIN {n=0}
 		tolower($3) ~ /degrees c/ {
-			name=$1
-			gsub(/^ *| *$/, "", name)
-			base=name
-			count[base]++
-			disp=base
-			if (count[base] > 1) disp=base " " count[base]
+			name=trim($1)
+			disp=ipmi_temp_display_name(name)
 			printf "%s\tipmi:%d\t%s\n", name, n, disp
 			n++
 		}
@@ -1051,9 +1102,28 @@ function TempDiscoveryIPMI {
 	printf '{\n"data":[%s\n]}\n' "$JSON"
 }
 
+function TempDiscoveryRedfish {
+	local OUT RESULT JSON LINE NAME INDEX DISP N
+	OUT="$(RedfishThermalOutput)" || return 1
+	N=0
+	while IFS= read -r LINE; do
+		printf '%s\n' "$LINE" | grep -q '"ReadingCelsius"' || continue
+		NAME="$(JsonStringValueFromLine "$LINE" "Name" | Trim)"
+		[ -n "$NAME" ] || NAME="Redfish Temp $N"
+		INDEX="redfish-temp:$N"
+		DISP="$NAME"
+		RESULT+="$(printf '\n{\n\"{#TEMP}\": \"%s\",\n\"{#TEMPINDEX}\": \"%s\"\n},' "$(echo "$DISP" | JsonEscape)" "$(echo "$INDEX" | JsonEscape)")"
+		N=$((N + 1))
+	done <<< "$(printf '%s\n' "$OUT" | JsonObjectLines)"
+	[ -n "$RESULT" ] || return 1
+	JSON="$(echo "$RESULT" | sed '$s/,$//')"
+	printf '{\n"data":[%s\n]}\n' "$JSON"
+}
+
 function TempDiscovery {
 	local OUT
 	OUT="$(TempDiscoveryOMSA)" && { [ "$SOURCE_ONLY" = "1" ] && echo "OMSA" || echo "$OUT"; SetSource "OMSA"; return; }
+	OUT="$(TempDiscoveryRedfish)" && { [ "$SOURCE_ONLY" = "1" ] && echo "Redfish" || echo "$OUT"; SetSource "Redfish"; return; }
 	OUT="$(TempDiscoveryIPMI)" && { [ "$SOURCE_ONLY" = "1" ] && echo "ipmitool" || echo "$OUT"; SetSource "ipmitool"; return; }
 	[ "$SOURCE_ONLY" = "1" ] && echo "none" || EmptyLLD
 }
@@ -1081,7 +1151,7 @@ function TempStatusIPMI {
 				n++
 			}
 		')" || return 1
-		VALUE="$(echo "$LINE" | grep -Eo '^[0-9.]+')"
+		VALUE="$(echo "$LINE" | grep -Eo '^-?[0-9.]+')"
 	elif echo "$TEMP" | grep -Eq '^[0-9]+$'; then
 		TARGET_INDEX="$TEMP"
 		LINE="$(IPMISensorOutput | awk -F'|' -v IDX="$TARGET_INDEX" '
@@ -1093,17 +1163,72 @@ function TempStatusIPMI {
 				n++
 			}
 		')" || return 1
-		VALUE="$(echo "$LINE" | grep -Eo '^[0-9.]+')"
+		VALUE="$(echo "$LINE" | grep -Eo '^-?[0-9.]+')"
 	else
-		VALUE="$(IPMISensorOutput | awk -F'|' -v T="$TEMP" '{name=$1; gsub(/^ *| *$/, "", name); if(name==T){gsub(/^ *| *$/, "", $2); print $2; exit}}' | grep -Eo '^[0-9.]+')"
+		VALUE="$(IPMISensorOutput | awk -F'|' -v T="$TEMP" '
+			function trim(s) {
+				gsub(/^ *| *$/, "", s)
+				return s
+			}
+			function ipmi_temp_display_name(raw) {
+				if (raw == "Inlet Temp") return "System Board Inlet Temp"
+				if (raw == "Exhaust Temp") return "System Board Exhaust Temp"
+				if (raw == "Temp") {
+					cpu_temp_count++
+					return "CPU" cpu_temp_count " Temp"
+				}
+				return raw
+			}
+			tolower($3) ~ /degrees c/ {
+				raw=trim($1)
+				disp=ipmi_temp_display_name(raw)
+				legacy=raw
+				if (raw == "Temp" && cpu_temp_count > 1) legacy="Temp " cpu_temp_count
+				if (raw==T || disp==T || legacy==T) {
+					val=trim($2)
+					print val
+					exit
+				}
+			}
+		' | grep -Eo '^-?[0-9.]+')"
 	fi
 	[ -n "$VALUE" ] || return 1
 	echo "$VALUE"
 }
 
+function TempStatusRedfish {
+	local TEMP="$1"
+	local OUT LINE VALUE TARGET_INDEX
+	OUT="$(RedfishThermalOutput)" || return 1
+	if echo "$TEMP" | grep -Eq '^redfish-temp:[0-9]+$'; then
+		TARGET_INDEX="${TEMP#redfish-temp:}"
+		LINE="$(printf '%s\n' "$OUT" | JsonObjectLines | awk -v IDX="$TARGET_INDEX" '
+			/"ReadingCelsius"/ {
+				if (n==IDX) {print; exit}
+				n++
+			}
+		')"
+	else
+		LINE="$(printf '%s\n' "$OUT" | JsonObjectLines | awk -v T="$TEMP" '
+			/"ReadingCelsius"/ {
+				line=$0
+				name=line
+				gsub(/^.*"Name"[[:space:]]*:[[:space:]]*"/, "", name)
+				gsub(/".*$/, "", name)
+				if (name==T) {print line; exit}
+			}
+		')"
+	fi
+	[ -n "$LINE" ] || return 1
+	VALUE="$(JsonNumberValueFromLine "$LINE" "ReadingCelsius")"
+	[ -n "$VALUE" ] || return 1
+	printf '%s\n' "$VALUE"
+}
+
 function TempStatus {
 	local VALUE
 	VALUE="$(TempStatusOMSA "$1")" && [ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
+	VALUE="$(TempStatusRedfish "$1")" && [ -n "$VALUE" ] && PrintValue "Redfish" "$VALUE" && return
 	VALUE="$(TempStatusIPMI "$1")" && [ -n "$VALUE" ] && PrintValue "ipmitool" "$VALUE" && return
 	# ZabbixのNumeric(float)アイテムをunsupportedにしないため、取得不可時は数値を返す
 	# 既定は -273 です。未対応/取得不可が一目で分かるようにしています。
@@ -1188,37 +1313,104 @@ function RAMStatus {
 	PrintValue "none" "Unsupported"
 }
 
-function PowerDiscovery {
-	local OUT PWRS PWR INDEX PROBE RESULT JSON
-	OUT="$(OMSARun chassis pwrmonitoring 2>/dev/null)" || true
+function PowerDiscoveryOMSA {
+	local OUT LINE INDEX PROBE RESULT JSON
+	OUT="$(OMSARun chassis pwrmonitoring 2>/dev/null)" || return 1
 	if echo "$OUT" | grep -q "Power Consumption Information is not available"; then
-		EmptyLLD
-		return
+		return 1
 	fi
-	PWRS="$(echo "$OUT" | grep "^Index\|^Probe Name" | cut -d':' -f2 | sed 's/^ //' | paste - -)"
-	if [ -n "$PWRS" ]; then
-		while IFS= read -r PWR; do
-			INDEX="$(echo "$PWR" | awk '{print $1}')"
-			PROBE="$(echo "$PWR" | cut -d' ' -f2- | Trim)"
-			RESULT+="$(printf '\n{\n\"{#PWRINDEX}\": \"%s\",\n\"{#PWRNAME}\": \"%s\"\n},' "$(echo "$INDEX" | JsonEscape)" "$(echo "$PROBE" | JsonEscape)")"
-		done <<< "$PWRS"
-		JSON="$(echo "$RESULT" | sed '$s/,$//')"
-		printf '{\n"data":[%s\n]}\n' "$JSON"
-		return
-	fi
-	EmptyLLD
+	while IFS= read -r LINE; do
+		case "$LINE" in
+			Index*)
+				INDEX="$(printf '%s\n' "$LINE" | cut -d':' -f2- | Trim)"
+				;;
+			"Probe Name"*)
+				PROBE="$(printf '%s\n' "$LINE" | cut -d':' -f2- | Trim)"
+				if [ -n "$INDEX" ] && [ -n "$PROBE" ]; then
+					RESULT+="$(printf '\n{\n\"{#PWRINDEX}\": \"%s\",\n\"{#PWRNAME}\": \"%s\"\n},' "$(echo "$INDEX" | JsonEscape)" "$(echo "$PROBE" | JsonEscape)")"
+					INDEX=""
+					PROBE=""
+				fi
+				;;
+		esac
+	done <<< "$OUT"
+	[ -n "$RESULT" ] || return 1
+	JSON="$(echo "$RESULT" | sed '$s/,$//')"
+	printf '{\n"data":[%s\n]}\n' "$JSON"
 }
 
-function PowerStatus {
+function PowerDiscoveryRedfish {
+	local OUT RESULT JSON LINE NAME INDEX N
+	OUT="$(RedfishPowerOutput)" || return 1
+	N=0
+	while IFS= read -r LINE; do
+		printf '%s\n' "$LINE" | grep -q '"PowerConsumedWatts"' || continue
+		NAME="$(JsonStringValueFromLine "$LINE" "Name" | Trim)"
+		[ -n "$NAME" ] || NAME="Power Consumption $N"
+		INDEX="redfish-pwr:$N"
+		RESULT+="$(printf '\n{\n\"{#PWRINDEX}\": \"%s\",\n\"{#PWRNAME}\": \"%s\"\n},' "$(echo "$INDEX" | JsonEscape)" "$(echo "$NAME" | JsonEscape)")"
+		N=$((N + 1))
+	done <<< "$(printf '%s\n' "$OUT" | JsonObjectLines)"
+	[ -n "$RESULT" ] || return 1
+	JSON="$(echo "$RESULT" | sed '$s/,$//')"
+	printf '{\n"data":[%s\n]}\n' "$JSON"
+}
+
+function PowerDiscovery {
+	local OUT
+	OUT="$(PowerDiscoveryOMSA)" && { [ "$SOURCE_ONLY" = "1" ] && echo "OMSA" || echo "$OUT"; SetSource "OMSA"; return; }
+	OUT="$(PowerDiscoveryRedfish)" && { [ "$SOURCE_ONLY" = "1" ] && echo "Redfish" || echo "$OUT"; SetSource "Redfish"; return; }
+	[ "$SOURCE_ONLY" = "1" ] && echo "none" || EmptyLLD
+}
+
+function PowerStatusOMSA {
 	local INDEX="$1"
 	local OUT VALUE
-	OUT="$(OMSARun chassis pwrmonitoring 2>/dev/null)" || true
+	OUT="$(OMSARun chassis pwrmonitoring 2>/dev/null)" || return 1
 	VALUE="$(echo "$OUT" | awk -v IDX="$INDEX" '
 		/^Index/ {cur_idx=$NF}
 		/^Reading/ && $NF=="W" && cur_idx==IDX {print $(NF-1); exit}
 	')"
-	[ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
-	PrintValue "none" "Unknown"
+	[ -n "$VALUE" ] || return 1
+	printf '%s\n' "$VALUE"
+}
+
+function PowerStatusRedfish {
+	local INDEX="$1"
+	local OUT LINE VALUE TARGET_INDEX
+	OUT="$(RedfishPowerOutput)" || return 1
+	if echo "$INDEX" | grep -Eq '^redfish-pwr:[0-9]+$'; then
+		TARGET_INDEX="${INDEX#redfish-pwr:}"
+		LINE="$(printf '%s\n' "$OUT" | JsonObjectLines | awk -v IDX="$TARGET_INDEX" '
+			/"PowerConsumedWatts"/ {
+				if (n==IDX) {print; exit}
+				n++
+			}
+		')"
+	else
+		LINE="$(printf '%s\n' "$OUT" | JsonObjectLines | awk -v T="$INDEX" '
+			/"PowerConsumedWatts"/ {
+				line=$0
+				name=line
+				gsub(/^.*"Name"[[:space:]]*:[[:space:]]*"/, "", name)
+				gsub(/".*$/, "", name)
+				if (name==T) {print line; exit}
+			}
+		')"
+	fi
+	[ -n "$LINE" ] || return 1
+	VALUE="$(JsonNumberValueFromLine "$LINE" "PowerConsumedWatts")"
+	[ -n "$VALUE" ] || return 1
+	printf '%s\n' "$VALUE"
+}
+
+function PowerStatus {
+	local INDEX="$1"
+	local VALUE
+	VALUE="$(PowerStatusOMSA "$INDEX")" && [ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
+	VALUE="$(PowerStatusRedfish "$INDEX")" && [ -n "$VALUE" ] && PrintValue "Redfish" "$VALUE" && return
+	# 消費電力はNumeric型想定のため、取得不可時に文字列を返さないよう0を返します。
+	PrintValue "none" "0"
 }
 
 function BmcInfo {
