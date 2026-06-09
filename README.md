@@ -6,7 +6,7 @@
 既存の`omsa.*`キーとの互換性を維持しつつ、OMSAが使える環境ではOMSAを最優先で使用します。<br>
 OMSAが無い環境やOMSAで取得できない項目は、`dmidecode`、`ipmitool -I open`、`perccli`、Redfish、`racadm`等で取得を試みます。
 
-更新日: 2026年5月25日(月)
+更新日: 2026年6月9日(火)
 
 ---
 
@@ -25,6 +25,7 @@ OMSAが無い環境やOMSAで取得できない項目は、`dmidecode`、`ipmito
 - [🏷️ 状態値の扱い](#status-values)
 - [🔢 数値アイテムの取得不可時の値](#numeric-fallback)
 - [🛠️ インストール方法](#install)
+- [🔑 sudoers.d設定](#sudoers)
 - [📥 必要パッケージ](#packages)
 - [💽 perccliについて](#perccli)
 - [🌐 Redfishについて](#redfish)
@@ -59,7 +60,7 @@ OMSAが無い環境やOMSAで取得できない項目は、`dmidecode`、`ipmito
 
 | 種別 | バージョン |
 |---|---|
-| スクリプト | 2.0.1 |
+| スクリプト | 2.0.2 |
 | OMSA | 11.0.0.0 |
 | Zabbix | 7.0.26 |
 | perccli | 007.1020.0000.0000 |
@@ -254,12 +255,10 @@ chmod 700 /home/zabbix/github/zabbix-dell-omsa/omsa.sh
 
 ### 5. Zabbixユーザーの実行権限を追加
 
-`visudo`で以下を追加します。
+Zabbix Agentから`omsa.sh`をroot権限で実行できるようにします。<br>
+本リポジトリでは、`/etc/sudoers`本体へ直接追記するのではなく、`/etc/sudoers.d/zabbix-omsa`として分離して管理する方針です。
 
-```text
-zabbix ALL=(ALL)  NOPASSWD: /home/zabbix/.sh/omsa.sh
-zabbix ALL=(ALL)  NOPASSWD: /home/zabbix/github/zabbix-dell-omsa/omsa.sh
-```
+詳細は[🔑 sudoers.d設定](#sudoers)を参照してください。
 
 ### 6. Zabbix AgentのTimeoutを確認
 
@@ -303,6 +302,128 @@ systemctl restart zabbix-agent2
 ### 8. テンプレートをインポート
 
 `dell-omsa-template-ja.xml`をZabbix Serverにインポートして、対象ホストにテンプレートを割り当てます。
+
+<a id="sudoers"></a>
+
+## 🔑 sudoers.d設定
+
+Zabbix Agentは通常`zabbix`ユーザーで動作する為、Dellハードウェア情報を取得する`omsa.sh`はsudo経由でroot権限実行します。<br>
+設定は`/etc/sudoers`本体ではなく、`/etc/sudoers.d/zabbix-omsa`へ分離することを推奨します。<br>
+これにより、Git管理やOSごとの差分管理がしやすくなります。
+
+### sudoers.dの読み込み確認
+
+RedHat系では、以下のように表示されることがあります。
+
+```shell
+grep -n 'includedir' /etc/sudoers
+```
+
+```text
+## Read drop-in files from /etc/sudoers.d (the # here does not mean a comment)
+#includedir /etc/sudoers.d
+```
+
+この`#includedir`の`#`はコメントではありません。<br>
+その為、`#`は消さずにそのままでOKです。
+
+Ubuntu系では、以下のような形式が多いです。
+
+```text
+@includedir /etc/sudoers.d
+```
+
+これもそのままでOKです。
+
+### 従来sudo環境向け
+
+CentOS7、AlmaLinux 9、Ubuntu 24.04等、従来sudoを使う環境では、同梱の`sudoers.d/zabbix-omsa`を使用します。<br>
+この設定では、`omsa.sh`に該当するsudo成功ログとPAM sessionログを抑制します。
+
+配置例です。
+
+```shell
+install -o root -g root -m 440 sudoers.d/zabbix-omsa /etc/sudoers.d/zabbix-omsa
+```
+
+文法確認を行います。
+
+```shell
+visudo -cf /etc/sudoers.d/zabbix-omsa
+```
+
+```shell
+visudo -c
+```
+
+### sudo-rs環境向け
+
+Ubuntu 26.04やその他環境でsudo-rsを使う環境では、従来sudo向けの以下の設定が使えません。
+
+```text
+Defaults!ZABBIX_OMSA syslog_goodpri=none
+Defaults!ZABBIX_OMSA !pam_session
+```
+
+sudo-rs環境では、同梱の`sudoers.d/zabbix-omsa.sudo-rs`を`/etc/sudoers.d/zabbix-omsa`として配置してください。<br>
+sudo-rs向け設定は実行許可のみを行い、sudoログ抑制は行いません。
+
+配置例です。
+
+```shell
+install -o root -g root -m 440 sudoers.d/zabbix-omsa.sudo-rs /etc/sudoers.d/zabbix-omsa
+```
+
+文法確認を行います。
+
+```shell
+visudo -cf /etc/sudoers.d/zabbix-omsa
+```
+
+```shell
+visudo -c
+```
+
+### 動作確認
+
+zabbixユーザーからsudo実行できるか確認します。
+
+```shell
+runuser -u zabbix -- sudo -n /home/zabbix/.sh/omsa.sh model
+```
+
+引数付きも確認します。
+
+```shell
+runuser -u zabbix -- sudo -n /home/zabbix/.sh/omsa.sh bmc ipv4
+```
+
+ログ確認です。
+
+```shell
+journalctl -n 100 --no-pager | grep -E 'sudo|omsa|pam_unix'
+```
+
+従来sudo向け設定では、`omsa.sh`実行時のsudo成功ログとPAM sessionログが出なくなる想定です。<br>
+sudo-rs向け設定では、実行許可のみの為、sudoログはjournalに残ります。
+
+### 既存sudoers設定から移行する場合
+
+既に`/etc/sudoers`本体に以下のような行がある場合は、先に`/etc/sudoers.d/zabbix-omsa`を作成して動作確認してから削除またはコメントアウトしてください。
+
+```text
+zabbix  ALL=(ALL)  NOPASSWD: /home/zabbix/.sh/omsa.sh
+```
+
+安全な作業順です。
+
+1. `/etc/sudoers.d`のincludeを確認する。
+2. `/etc/sudoers.d/zabbix-omsa`を配置する。
+3. `visudo -cf /etc/sudoers.d/zabbix-omsa`で確認する。
+4. `visudo -c`で全体確認する。
+5. `zabbix`ユーザーで`omsa.sh`実行確認を行う。
+6. 問題なければ`/etc/sudoers`本体の既存zabbix行を削除またはコメントアウトする。
+7. 再度`visudo -c`で確認する。
 
 <a id="packages"></a>
 
@@ -558,6 +679,14 @@ chmod 600 /home/zabbix/.config/dell-redfish.conf
 既定では`240`秒です。<br>
 IPMIセンサーキャッシュは、実行ユーザーごとに分離されます。<br>
 rootで手動確認したキャッシュが、Zabbix実行時に干渉しにくいようにしています。
+
+## 📝 2.0.2での主な変更
+
+- `sudoers.d/zabbix-omsa`を追加しました。
+- 従来sudo環境では、`omsa.sh`実行時のsudo成功ログとPAM sessionログを抑制できるようにしました。
+- Proxmox 9、Ubuntu 26.04等のsudo-rs環境向けに、`sudoers.d/zabbix-omsa.sudo-rs`を追加しました。
+- sudo-rs環境では、sudoersだけで`omsa.sh`のsudoログを個別抑制できない為、実行許可のみ行う方針をREADMEへ追記しました。
+- `omsa.sh`本体の監視処理には変更ありません。
 
 <a id="notes"></a>
 

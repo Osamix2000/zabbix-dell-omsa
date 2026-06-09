@@ -1,0 +1,17 @@
+# Zabbix AgentからDellハードウェア監視スクリプトをroot権限で実行するための設定です。
+# /home/zabbix/.sh/omsa.sh は既存のZabbixテンプレート/UserParameterから呼ばれるスクリプトです。
+
+# Zabbixからsudo実行を許可する対象コマンドを定義します。
+# sudoersでは、コマンドパスだけを書いた場合、そのコマンドに対する引数付き実行も許可されます。
+Cmnd_Alias ZABBIX_OMSA = /home/zabbix/.sh/omsa.sh
+
+# ZABBIX_OMSAに該当するsudo成功ログをsyslog/journalへ出さないようにします。
+# これにより「zabbix : PWD=/ ; USER=root ; COMMAND=...」のログを抑制します。
+Defaults!ZABBIX_OMSA syslog_goodpri=none
+
+# ZABBIX_OMSAに該当するsudo実行時のPAM session処理を無効化します。
+# これにより「pam_unix(sudo:session): session opened/closed」のログを抑制します。
+Defaults!ZABBIX_OMSA !pam_session
+
+# zabbixユーザーに対して、ZABBIX_OMSAをroot権限かつパスワード無しで実行することを許可します。
+zabbix ALL=(root) NOPASSWD: ZABBIX_OMSA

@@ -5,7 +5,7 @@
 
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="2.0.2"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_UID="$(id -u 2>/dev/null || echo unknown)"
 

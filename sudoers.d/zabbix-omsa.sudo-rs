@@ -1,0 +1,14 @@
+# Zabbix AgentからDellハードウェア監視スクリプトをroot権限で実行するための設定です。
+# /home/zabbix/.sh/omsa.sh は既存のZabbixテンプレート/UserParameterから呼ばれるスクリプトです。
+#
+# Proxmox 9やUbuntu 26.04等のsudo-rs環境向けです。
+# sudo-rsでは、従来sudo向けのsyslog_goodpriやpam_sessionが使えない為、
+# ここではsudo実行自体の許可のみを行い、ログ抑制は行いません。
+
+# Zabbixからsudo実行を許可する対象コマンドを定義します。
+# この行では、/home/zabbix/.sh/omsa.sh のsudo実行を ZABBIX_OMSA という別名で扱います。
+Cmnd_Alias ZABBIX_OMSA = /home/zabbix/.sh/omsa.sh
+
+# zabbixユーザーに対して、ZABBIX_OMSAをroot権限かつパスワード無しで実行することを許可します。
+# sudo実行自体の許可だけを行い、ログ抑制はここでは行いません。
+zabbix ALL=(root) NOPASSWD: ZABBIX_OMSA
