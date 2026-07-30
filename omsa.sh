@@ -5,7 +5,7 @@
 
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-SCRIPT_VERSION="2.0.2"
+SCRIPT_VERSION="2.1.0"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_UID="$(id -u 2>/dev/null || echo unknown)"
 
@@ -322,7 +322,7 @@ function RemoveStaleIPMILock {
 }
 
 function IPMISensorOutput {
-	local OUT WAIT_COUNT TMPFILE
+	local OUT OUT_REMOTE OUT_BMC WAIT_COUNT TMPFILE
 
 	# 新しいキャッシュがあれば即返す
 	if CacheIsFresh "$IPMI_SENSOR_CACHE" "$IPMI_CACHE_TTL"; then
@@ -386,10 +386,17 @@ function OMSABmcOutput {
 	RemoveStaleIPMILock "$OMSA_BMC_CACHE_LOCK" 30
 
 	if mkdir "$OMSA_BMC_CACHE_LOCK" 2>/dev/null; then
-		OUT="$(OMSARun chassis bmc 2>/dev/null)" || true
+		# 新しいOMSAのremoteaccessと旧来のbmcで取得できる項目が異なるため、利用可能なら両方を結合します。
+		OUT_REMOTE="$(OMSARun chassis remoteaccess 2>/dev/null)" || true
+		OUT_BMC="$(OMSARun chassis bmc 2>/dev/null)" || true
+		OUT="${OUT_REMOTE}"
+		[ -n "$OUT_BMC" ] && OUT="${OUT}${OUT:+$'\n'}${OUT_BMC}"
 		if [ -z "$OUT" ]; then
 			sleep 1
-			OUT="$(OMSARun chassis bmc 2>/dev/null)" || true
+			OUT_REMOTE="$(OMSARun chassis remoteaccess 2>/dev/null)" || true
+			OUT_BMC="$(OMSARun chassis bmc 2>/dev/null)" || true
+			OUT="${OUT_REMOTE}"
+			[ -n "$OUT_BMC" ] && OUT="${OUT}${OUT:+$'\n'}${OUT_BMC}"
 		fi
 
 		if [ -n "$OUT" ]; then
@@ -439,6 +446,47 @@ function ExtractOmreportField {
 			print $0
 			exit
 		}
+	'
+}
+
+
+# omreportのlist形式はバージョンやコマンドによって空白位置や単位の付け方が変わるため、
+# 固定列ではなく「項目名 : 値」を基準に解析します。11.0系/11.1系の両方を同じ処理で扱います。
+function ExtractOmreportFields {
+	local FIELD="$1"
+	awk -F':' -v FIELD="$FIELD" '
+		$0 ~ "^[[:space:]]*" FIELD "[[:space:]]*:" {
+			$1=""
+			sub(/^:/, "", $0)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+			print $0
+		}
+	'
+}
+
+function ExtractOmreportNumber {
+	local FIELD="$1"
+	local VALUE
+	VALUE="$(ExtractOmreportField "$FIELD")"
+	[ -n "$VALUE" ] || return 1
+	printf '%s\n' "$VALUE" | grep -Eo -- '-?[0-9]+([.][0-9]+)?' | head -1
+}
+
+function ExtractOmreportBlockByIndex {
+	local INDEX="$1"
+	awk -F':' -v IDX="$INDEX" '
+		function trim(s) {
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+			return s
+		}
+		/^[[:space:]]*Index[[:space:]]*:/ {
+			v=$0
+			sub(/^[^:]*:/, "", v)
+			v=trim(v)
+			if (in_block && v != IDX) exit
+			in_block=(v == IDX)
+		}
+		in_block {print}
 	'
 }
 
@@ -671,7 +719,7 @@ function RedfishPowerOutput {
 function SystemModel {
 	local OUT VALUE
 	OUT="$(OMSAValueOrEmpty chassis info)"
-	VALUE="$(echo "$OUT" | awk -F':' '/^Chassis Model/ {print $2; exit}' | Trim)"
+	VALUE="$(printf '%s\n' "$OUT" | ExtractOmreportField "Chassis Model")"
 	[ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
 
 	VALUE="$(DmiGet system-product-name)"
@@ -686,7 +734,7 @@ function SystemModel {
 function SystemServiceTag {
 	local OUT VALUE
 	OUT="$(OMSAValueOrEmpty chassis info)"
-	VALUE="$(echo "$OUT" | awk -F':' '/^Chassis Service Tag/ {print $2; exit}' | Trim)"
+	VALUE="$(printf '%s\n' "$OUT" | ExtractOmreportField "Chassis Service Tag")"
 	[ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
 
 	VALUE="$(DmiGet system-serial-number)"
@@ -704,7 +752,7 @@ function SystemServiceTag {
 function SystemBiosVersion {
 	local OUT VALUE
 	OUT="$(OMSAValueOrEmpty chassis bios)"
-	VALUE="$(echo "$OUT" | awk '/^Version/ {print $3; exit}' | Trim)"
+	VALUE="$(printf '%s\n' "$OUT" | ExtractOmreportField "Version")"
 	[ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
 
 	VALUE="$(DmiGet bios-version)"
@@ -719,7 +767,17 @@ function SystemBiosVersion {
 function SystemIdracVersion {
 	local OUT VALUE
 	OUT="$(OMSAValueOrEmpty chassis info)"
-	VALUE="$(echo "$OUT" | awk 'BEGIN{IGNORECASE=1} /^idrac/ {print $1,$4; exit}' | Trim)"
+	VALUE="$(printf '%s\n' "$OUT" | awk -F':' '
+		BEGIN {IGNORECASE=1}
+		/^[[:space:]]*iDRAC/ {
+			label=$1
+			value=$2
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", label)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+			sub(/[[:space:]]+Version$/, "", label)
+			if (value != "") {print label " " value; exit}
+		}
+	')"
 	[ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
 
 	VALUE="$(RedfishManagerValue FirmwareVersion)"
@@ -731,7 +789,6 @@ function SystemIdracVersion {
 
 	PrintValue "none" "none"
 }
-
 function SystemStatus {
 	local OUT VALUE
 	OUT="$(OMSAValueOrEmpty chassis)"
@@ -765,10 +822,10 @@ function SystemStatus {
 
 function PhysicalDisksDiscoveryOMSA {
 	local CONTROLLERS CONTROLLER DISKS DISK RESULT JSON
-	CONTROLLERS="$(OMSARun storage controller | grep ^ID | awk '{print $3}')" || return 1
+	CONTROLLERS="$(OMSARun storage controller | ExtractOmreportFields "ID")" || return 1
 	[ -n "$CONTROLLERS" ] || return 1
 	for CONTROLLER in $CONTROLLERS; do
-		DISKS="$(OMSARun storage pdisk controller="$CONTROLLER" | grep ^ID | awk '{print $3}')"
+		DISKS="$(OMSARun storage pdisk controller="$CONTROLLER" | ExtractOmreportFields "ID")"
 		for DISK in $DISKS; do
 			RESULT+="$(printf '\n{\n\"{#PDISK}\": \"%s\",\n\"{#CONTROLLER}\": \"%s\"\n},' "$(echo "$DISK" | JsonEscape)" "$(echo "$CONTROLLER" | JsonEscape)")"
 		done
@@ -809,10 +866,10 @@ function PhysicalDiskStatusOMSA {
 	[ -n "$OUT" ] || return 1
 	case "$ITEM" in
 		status)
-			VALUE="$(echo "$OUT" | awk '/^State/ {print $3; exit}')"
+			VALUE="$(printf '%s\n' "$OUT" | ExtractOmreportField "State")"
 			;;
 		pfailure)
-			VALUE="$(echo "$OUT" | awk '/^Failure Predicted/ {print $4; exit}')"
+			VALUE="$(printf '%s\n' "$OUT" | ExtractOmreportField "Failure Predicted")"
 			;;
 	esac
 	[ -n "$VALUE" ] || return 1
@@ -861,10 +918,10 @@ function PhysicalDiskStatus {
 
 function VirtualDiskDiscoveryOMSA {
 	local CONTROLLERS CONTROLLER VDISKS VDISK RESULT JSON
-	CONTROLLERS="$(OMSARun storage controller | grep ^ID | awk '{print $3}')" || return 1
+	CONTROLLERS="$(OMSARun storage controller | ExtractOmreportFields "ID")" || return 1
 	[ -n "$CONTROLLERS" ] || return 1
 	for CONTROLLER in $CONTROLLERS; do
-		VDISKS="$(OMSARun storage vdisk controller="$CONTROLLER" | grep '^ID' | awk '{print $3}')"
+		VDISKS="$(OMSARun storage vdisk controller="$CONTROLLER" | ExtractOmreportFields "ID")"
 		for VDISK in $VDISKS; do
 			RESULT+="$(printf '\n{\n\"{#VDISK}\": \"%s\",\n\"{#CONTROLLER}\": \"%s\"\n},' "$(echo "$VDISK" | JsonEscape)" "$(echo "$CONTROLLER" | JsonEscape)")"
 		done
@@ -899,25 +956,30 @@ function VirtualDiskStatusOMSA {
 	local VDISK="$1"
 	local CONTROLLER="$2"
 	local ITEM="$3"
-	local OUT VALUE
+	local OUT VALUE SIZE_VALUE NUMBER UNIT
 	OUT="$(OMSARun storage vdisk controller="$CONTROLLER" vdisk="$VDISK")" || return 1
 	[ -n "$OUT" ] || return 1
 	case "$ITEM" in
 		status)
-			VALUE="$(echo "$OUT" | awk '/^Status/ {print $3; exit}')"
+			VALUE="$(printf '%s\n' "$OUT" | ExtractOmreportField "Status")"
 			VALUE="$(NormalizeHealth "$VALUE")"
 			;;
 		raid)
-			VALUE="$(echo "$OUT" | awk '/^Layout/ {print $3; exit}')"
+			VALUE="$(printf '%s\n' "$OUT" | ExtractOmreportField "Layout")"
 			;;
 		size)
-			VALUE="$(echo "$OUT" | awk -F'[()]' '/^Size/ && $2 ~ /bytes/ {gsub(/[^0-9]/, "", $2); print $2; exit}')"
+			SIZE_VALUE="$(printf '%s\n' "$OUT" | ExtractOmreportField "Size")"
+			[ -n "$SIZE_VALUE" ] || return 1
+			VALUE="$(printf '%s\n' "$SIZE_VALUE" | awk -F'[()]' 'tolower($2) ~ /bytes/ {v=$2; gsub(/[^0-9]/, "", v); print v; exit}')"
 			if [ -z "$VALUE" ]; then
-				VALUE="$(echo "$OUT" | awk '/^Size/ {for(i=1;i<=NF;i++){if($i ~ /^[0-9,.]+$/){v=$i; u=$(i+1); gsub(/,/, "", v); print v " " u; exit}}}')"
-				if [ -n "$VALUE" ]; then
-					VALUE="$(SizeToBytes "$(echo "$VALUE" | awk '{print $1}')" "$(echo "$VALUE" | awk '{print $2}')")"
-				fi
+				NUMBER="$(printf '%s\n' "$SIZE_VALUE" | grep -Eo '[0-9][0-9,]*(\.[0-9]+)?' | head -1 | tr -d ',')"
+				UNIT="$(printf '%s\n' "$SIZE_VALUE" | grep -Eio '(K|M|G|T|P)(i)?B' | head -1)"
+				[ -n "$NUMBER" ] && [ -n "$UNIT" ] || return 1
+				VALUE="$(SizeToBytes "$NUMBER" "$UNIT")"
 			fi
+			;;
+		*)
+			return 1
 			;;
 	esac
 	[ -n "$VALUE" ] || return 1
@@ -965,7 +1027,7 @@ function VirtualDiskStatus {
 function FanDiscoveryOMSA {
 	local OUT FANS FAN RESULT JSON
 	OUT="$(OMSARun chassis fans)" || return 1
-	FANS="$(echo "$OUT" | grep ^Index | awk '{print $3}')"
+	FANS="$(printf '%s\n' "$OUT" | ExtractOmreportFields "Index")"
 	[ -n "$FANS" ] || return 1
 	for FAN in $FANS; do
 		RESULT+="$(printf '\n{\n\"{#FAN}\": \"%s\"\n},' "$(echo "$FAN" | JsonEscape)")"
@@ -1001,11 +1063,15 @@ function FanStatusOMSA {
 	[ -n "$OUT" ] || return 1
 	case "$ITEM" in
 		rpm)
-			VALUE="$(echo "$OUT" | awk '/^Reading/ {print $3; exit}')"
+			# OMSA 11.0系の「2380 RPM」と11.1系等の「2380RPM」の両方から数値だけを返します。
+			VALUE="$(printf '%s\n' "$OUT" | ExtractOmreportNumber "Reading")"
 			;;
 		status)
-			VALUE="$(echo "$OUT" | awk '/^Status/ {print $3; exit}')"
+			VALUE="$(printf '%s\n' "$OUT" | ExtractOmreportField "Status")"
 			VALUE="$(NormalizeHealth "$VALUE")"
+			;;
+		*)
+			return 1
 			;;
 	esac
 	[ -n "$VALUE" ] || return 1
@@ -1051,10 +1117,10 @@ function TempDiscoveryOMSA {
 	while IFS= read -r LINE; do
 		case "$LINE" in
 			Index*)
-				INDEX="$(printf '%s\n' "$LINE" | cut -d':' -f2- | Trim)"
+				INDEX="$(printf '%s\n' "$LINE" | ExtractOmreportField "Index")"
 				;;
 			"Probe Name"*)
-				PROBE="$(printf '%s\n' "$LINE" | cut -d':' -f2- | Trim)"
+				PROBE="$(printf '%s\n' "$LINE" | ExtractOmreportField "Probe Name")"
 				if [ -n "$INDEX" ] && [ -n "$PROBE" ]; then
 					RESULT+="$(printf '\n{\n\"{#TEMP}\": \"%s\",\n\"{#TEMPINDEX}\": \"%s\"\n},' "$(echo "$PROBE" | JsonEscape)" "$(echo "$INDEX" | JsonEscape)")"
 					INDEX=""
@@ -1132,7 +1198,7 @@ function TempStatusOMSA {
 	local INDEX="$1"
 	local OUT VALUE
 	OUT="$(OMSARun chassis temps index="$INDEX")" || return 1
-	VALUE="$(echo "$OUT" | awk '/^Reading/ {print $3; exit}')"
+	VALUE="$(printf '%s\n' "$OUT" | ExtractOmreportNumber "Reading")"
 	[ -n "$VALUE" ] || return 1
 	echo "$VALUE"
 }
@@ -1238,7 +1304,7 @@ function TempStatus {
 function PsuDiscoveryOMSA {
 	local OUT PSUS PSU RESULT JSON
 	OUT="$(OMSARun chassis pwrsupplies)" || return 1
-	PSUS="$(echo "$OUT" | grep ^Index | awk '{print $3}')"
+	PSUS="$(printf '%s\n' "$OUT" | ExtractOmreportFields "Index")"
 	[ -n "$PSUS" ] || return 1
 	for PSU in $PSUS; do
 		RESULT+="$(printf '\n{\n\"{#PSU}\": \"%s\"\n},' "$(echo "$PSU" | JsonEscape)")"
@@ -1268,8 +1334,11 @@ function PsuDiscovery {
 
 function PsuStatusOMSA {
 	local PSU="$1"
-	local VALUE
-	VALUE="$(OMSARun chassis pwrsupplies | grep -A1 "^Index.*$PSU" | tail -1 | awk '{print $3}')"
+	local OUT BLOCK VALUE
+	OUT="$(OMSARun chassis pwrsupplies)" || return 1
+	BLOCK="$(printf '%s\n' "$OUT" | ExtractOmreportBlockByIndex "$PSU")"
+	[ -n "$BLOCK" ] || return 1
+	VALUE="$(printf '%s\n' "$BLOCK" | ExtractOmreportField "Status")"
 	[ -n "$VALUE" ] || return 1
 	NormalizeHealth "$VALUE"
 }
@@ -1292,7 +1361,7 @@ function PsuStatus {
 function RAMDiscovery {
 	local OUT RAMS RAM RESULT JSON
 	OUT="$(OMSARun chassis memory)"
-	RAMS="$(echo "$OUT" | grep "Index" | awk '{print $3}' | grep -Eo '[0-9]+')"
+	RAMS="$(printf '%s\n' "$OUT" | ExtractOmreportFields "Index" | grep -Eo '[0-9]+')"
 	if [ -n "$RAMS" ]; then
 		for RAM in $RAMS; do
 			RESULT+="$(printf '\n{\n\"{#RAM}\": \"%s\"\n},' "$(echo "$RAM" | JsonEscape)")"
@@ -1308,7 +1377,7 @@ function RAMStatus {
 	local RAM="$1"
 	local OUT VALUE
 	OUT="$(OMSARun chassis memory index="$RAM")" || true
-	VALUE="$(echo "$OUT" | awk '/^Status/ {print $3; exit}')"
+	VALUE="$(printf '%s\n' "$OUT" | ExtractOmreportField "Status")"
 	[ -n "$VALUE" ] && PrintValue "OMSA" "$(NormalizeHealth "$VALUE")" && return
 	PrintValue "none" "Unsupported"
 }
@@ -1322,10 +1391,10 @@ function PowerDiscoveryOMSA {
 	while IFS= read -r LINE; do
 		case "$LINE" in
 			Index*)
-				INDEX="$(printf '%s\n' "$LINE" | cut -d':' -f2- | Trim)"
+				INDEX="$(printf '%s\n' "$LINE" | ExtractOmreportField "Index")"
 				;;
 			"Probe Name"*)
-				PROBE="$(printf '%s\n' "$LINE" | cut -d':' -f2- | Trim)"
+				PROBE="$(printf '%s\n' "$LINE" | ExtractOmreportField "Probe Name")"
 				if [ -n "$INDEX" ] && [ -n "$PROBE" ]; then
 					RESULT+="$(printf '\n{\n\"{#PWRINDEX}\": \"%s\",\n\"{#PWRNAME}\": \"%s\"\n},' "$(echo "$INDEX" | JsonEscape)" "$(echo "$PROBE" | JsonEscape)")"
 					INDEX=""
@@ -1365,12 +1434,11 @@ function PowerDiscovery {
 
 function PowerStatusOMSA {
 	local INDEX="$1"
-	local OUT VALUE
+	local OUT BLOCK VALUE
 	OUT="$(OMSARun chassis pwrmonitoring 2>/dev/null)" || return 1
-	VALUE="$(echo "$OUT" | awk -v IDX="$INDEX" '
-		/^Index/ {cur_idx=$NF}
-		/^Reading/ && $NF=="W" && cur_idx==IDX {print $(NF-1); exit}
-	')"
+	BLOCK="$(printf '%s\n' "$OUT" | ExtractOmreportBlockByIndex "$INDEX")"
+	[ -n "$BLOCK" ] || return 1
+	VALUE="$(printf '%s\n' "$BLOCK" | ExtractOmreportNumber "Reading")"
 	[ -n "$VALUE" ] || return 1
 	printf '%s\n' "$VALUE"
 }
@@ -1501,11 +1569,11 @@ function BatteriesDiscoveryOMSA {
 		fi
 		[ "$IN_SECTION" -eq 1 ] || continue
 		if echo "$LINE" | grep -q "^Index"; then
-			CUR_INDEX="$(echo "$LINE" | awk '{print $3}')"
+			CUR_INDEX="$(printf '%s\n' "$LINE" | ExtractOmreportField "Index")"
 			continue
 		fi
 		if echo "$LINE" | grep -q "^Probe Name"; then
-			PROBE="$(echo "$LINE" | cut -d':' -f2- | Trim)"
+			PROBE="$(printf '%s\n' "$LINE" | ExtractOmreportField "Probe Name")"
 			RESULT+="$(printf '\n{\n\"{#BATTINDEX}\": \"%s\",\n\"{#BATTPROBE}\": \"%s\"\n},' "$(echo "$CUR_INDEX" | JsonEscape)" "$(echo "$PROBE" | JsonEscape)")"
 		fi
 	done <<< "$OUT"
@@ -1546,24 +1614,24 @@ function BatteriesStatusOMSA {
 	OUT="$(OMSARun chassis batteries 2>/dev/null)" || return 1
 	[ -n "$OUT" ] && echo "$OUT" | grep -q "^Batteries" || return 1
 	if [ "$FIELD" = "health" ]; then
-		VALUE="$(echo "$OUT" | awk -F':' '/^Health/ {gsub(/^ *| *$/, "", $2); print $2; exit}')"
+		VALUE="$(printf '%s\n' "$OUT" | ExtractOmreportField "Health")"
 		[ -n "$VALUE" ] && echo "$VALUE" && return 0
 	fi
 	while IFS= read -r LINE; do
 		if echo "$LINE" | grep -q "^Index"; then
-			CUR="$(echo "$LINE" | awk '{print $3}')"
+			CUR="$(printf '%s\n' "$LINE" | ExtractOmreportField "Index")"
 			continue
 		fi
 		[ "$CUR" = "$INDEX" ] || continue
 		case "$FIELD" in
 			status)
-				echo "$LINE" | grep -q "^Status[[:space:]]*:" && echo "$LINE" | awk -F':' '{gsub(/^ *| *$/, "", $2); print $2; exit}' && return 0
+				echo "$LINE" | grep -q "^Status[[:space:]]*:" && printf '%s\n' "$LINE" | ExtractOmreportField "Status" && return 0
 				;;
 			reading)
-				echo "$LINE" | grep -q "^Reading[[:space:]]*:" && echo "$LINE" | awk -F':' '{gsub(/^ *| *$/, "", $2); print $2; exit}' && return 0
+				echo "$LINE" | grep -q "^Reading[[:space:]]*:" && printf '%s\n' "$LINE" | ExtractOmreportField "Reading" && return 0
 				;;
 			probe)
-				echo "$LINE" | grep -q "^Probe Name[[:space:]]*:" && echo "$LINE" | awk -F':' '{gsub(/^ *| *$/, "", $2); print $2; exit}' && return 0
+				echo "$LINE" | grep -q "^Probe Name[[:space:]]*:" && printf '%s\n' "$LINE" | ExtractOmreportField "Probe Name" && return 0
 				;;
 		esac
 	done <<< "$OUT"
@@ -1617,17 +1685,29 @@ function BatteriesStatus {
 }
 
 function CmosBatteryStatus {
-	local OUT VALUE
+	local OUT LINE INDEX PROBE READING
 	OUT="$(OMSARun chassis batteries 2>/dev/null)" || true
-	VALUE="$(echo "$OUT" | awk '
-		/^Index/ {idx=$3}
-		/^Probe Name[[:space:]]*:[[:space:]]*System Board CMOS Battery/ {target=idx}
-		/^Reading/ && target==idx {print $3; exit}
-	')"
-	[ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
+	INDEX=""
+	PROBE=""
+	while IFS= read -r LINE; do
+		case "$LINE" in
+			Index*)
+				INDEX="$(printf '%s\n' "$LINE" | ExtractOmreportField "Index")"
+				PROBE=""
+				;;
+			"Probe Name"*)
+				PROBE="$(printf '%s\n' "$LINE" | ExtractOmreportField "Probe Name")"
+				;;
+			Reading*)
+				if [ -n "$INDEX" ] && [ "$PROBE" = "System Board CMOS Battery" ]; then
+					READING="$(printf '%s\n' "$LINE" | ExtractOmreportField "Reading")"
+					[ -n "$READING" ] && PrintValue "OMSA" "$READING" && return
+				fi
+				;;
+		esac
+	done <<< "$OUT"
 	PrintValue "none" "Unsupported"
 }
-
 
 function DetectOSFamily {
 	local ID_LIKE_SAFE="" ID_SAFE=""
@@ -1834,9 +1914,34 @@ EOF
 	echo "現在の想定接続先: $REDFISH_BASE"
 }
 
+function GetOMSAVersion {
+	local OUT VALUE
+	OUT="$(OMSARun about 2>/dev/null)" || true
+	VALUE="$(printf '%s\n' "$OUT" | ExtractOmreportField "Version")"
+	if [ -n "$VALUE" ]; then
+		printf '%s\n' "$VALUE"
+		return 0
+	fi
+	if IsCommand dpkg-query; then
+		VALUE="$(dpkg-query -W -f='${Version}\n' srvadmin-all 2>/dev/null | head -1)"
+		[ -n "$VALUE" ] && { printf '%s\n' "$VALUE"; return 0; }
+	fi
+	if IsCommand rpm; then
+		VALUE="$(rpm -q --qf '%{VERSION}-%{RELEASE}\n' srvadmin-all 2>/dev/null | head -1)"
+		[ -n "$VALUE" ] && { printf '%s\n' "$VALUE"; return 0; }
+	fi
+	return 1
+}
+
 function TestOMSA {
+	local VERSION
 	if OMSAUsable; then
-		echo "OMSA: OK"
+		VERSION="$(GetOMSAVersion 2>/dev/null || true)"
+		if [ -n "$VERSION" ]; then
+			echo "OMSA: OK (${VERSION})"
+		else
+			echo "OMSA: OK"
+		fi
 	else
 		echo "OMSA: Unsupported"
 	fi

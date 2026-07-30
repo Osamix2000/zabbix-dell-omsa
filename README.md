@@ -6,7 +6,7 @@
 既存の`omsa.*`キーとの互換性を維持しつつ、OMSAが使える環境ではOMSAを最優先で使用します。<br>
 OMSAが無い環境やOMSAで取得できない項目は、`dmidecode`、`ipmitool -I open`、`perccli`、Redfish、`racadm`等で取得を試みます。
 
-更新日: 2026年6月9日(火)
+更新日: 2026年7月30日(木)
 
 ---
 
@@ -14,6 +14,7 @@ OMSAが無い環境やOMSAで取得できない項目は、`dmidecode`、`ipmito
 
 - [🧭 現在の方針](#policy)
 - [✅ テスト済みバージョン](#tested-version)
+- [🔄 OMSA 11.0 / 11.1互換について](#omsa-version-compat)
 - [🧩 OMSAとは](#what-is-omsa)
 - [📊 Zabbixとは](#what-is-zabbix)
 - [📦 本リポジトリについて](#about-repository)
@@ -60,10 +61,56 @@ OMSAが無い環境やOMSAで取得できない項目は、`dmidecode`、`ipmito
 
 | 種別 | バージョン |
 |---|---|
-| スクリプト | 2.0.2 |
-| OMSA | 11.0.0.0 |
+| スクリプト | 2.1.0 |
+| OMSA | 11.0.0.0 / 11.1.0.0 |
 | Zabbix | 7.0.26 |
 | perccli | 007.1020.0000.0000 |
+
+<a id="omsa-version-compat"></a>
+
+## 🔄 OMSA 11.0 / 11.1互換について
+
+スクリプトv2.1.0では、OMSA 11.0.0.0と11.1.0.0の両方を同一コードで扱えるように、`omreport`の解析方法を見直しています。
+
+従来は一部で`awk '{print $3}'`等の固定列を参照していましたが、OMSAのバージョンやコマンドによって空白位置や単位表記が変わると誤取得する可能性があります。
+現在は可能な限り`項目名 : 値`を基準に取得します。
+
+特に以下を改修しています。
+
+- ファンRPM: `2380 RPM` / `2380RPM`の両方から`2380`だけを返す
+- 温度: `24.0 C` / `24.0C`の両方から数値だけを返す
+- 消費電力: `539 W` / `539W`の両方から数値だけを返す
+- ファン、温度、PSU、RAM、電力監視のIndex解析を固定列依存から変更
+- 物理ディスク、仮想ディスクのOMSA出力解析を項目名ベースへ変更
+- BMC/iDRAC情報は新しい`remoteaccess`と従来の`bmc`を利用可能な範囲で併用
+
+この設計はOMSAバージョン番号で処理を分岐する方式ではありません。
+その為、11.0.0.0/11.1.0.0だけでなく、同系統の出力形式を持つ小改訂でも壊れにくい構成を目指しています。
+
+### 11.0.0.0から11.1.0.0へ更新後にファンが0rpmになる場合
+
+まずスクリプト単体で確認します。
+
+```shell
+/home/zabbix/.sh/omsa.sh fandiscovery
+/home/zabbix/.sh/omsa.sh fanstatus 0 rpm
+/home/zabbix/.sh/omsa.sh fanstatus 0 status
+```
+
+OMSA生出力も確認します。
+
+```shell
+/opt/dell/srvadmin/bin/omreport chassis fans
+/opt/dell/srvadmin/bin/omreport chassis fans index=0
+```
+
+`fanstatus 0 rpm`が実際のRPM数値を返せば、Zabbix Agent側からも確認します。
+
+```shell
+zabbix_agentd -t 'omsa.fanstatus[0,rpm]'
+```
+
+Agent 2の場合は環境に応じて`zabbix_agent2 -t`を使用してください。
 
 <a id="what-is-omsa"></a>
 
