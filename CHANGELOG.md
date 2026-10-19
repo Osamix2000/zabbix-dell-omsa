@@ -31,3 +31,11 @@
 - `--test-omsa`で取得可能な場合にOMSAバージョンを表示
 - OMSA 11.0/11.1相当の出力差を確認する`tests/omsa-parser-compat-test.sh`を追加
 - GitHub管理向け`.gitignore`を追加し、SSH情報、秘密鍵、`.env`、一時ファイル、ログ、配布成果物等を除外
+
+## 2.0.2（過去の変更）
+
+- `sudoers.d/zabbix-omsa`を追加しました。
+- 従来sudo環境では、`omsa.sh`実行時のsudo成功ログとPAM sessionログを抑制できるようにしました。
+- Proxmox 9、Ubuntu 26.04等のsudo-rs環境向けに、`sudoers.d/zabbix-omsa.sudo-rs`を追加しました。
+- sudo-rs環境では、sudoersだけで`omsa.sh`のsudoログを個別抑制できないため、実行許可のみ行う方針をREADMEに記載しました。
+- この版では、`omsa.sh`本体の監視処理に変更はありません。
