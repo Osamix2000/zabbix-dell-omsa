@@ -64,7 +64,7 @@ OMSAが無い環境やOMSAで取得できない項目は、`dmidecode`、`ipmito
 |---|---|
 | スクリプト | 2.0.3（developでリリース準備中） |
 | OMSA | 11.0.0.0 / 11.1.0.0 |
-| Zabbix | 7.0.26 |
+| Zabbix | 7.0.31 |
 | perccli | 007.1020.0000.0000 |
 
 <a id="omsa-version-compat"></a>
@@ -295,74 +295,80 @@ TEMP_UNSUPPORTED_VALUE=-999 /home/zabbix/.sh/omsa.sh tempstatus Inlet Temp
 
 ## 🛠️ インストール方法
 
+以下はrootで操作する前提です。**Gitとzabbix所有ファイルの操作は`runuser -u zabbix --`を付けて実行**します。先にZabbix Agentと`zabbix`ユーザーを準備してください。
+
 ### 1. リポジトリをクローン
 
 ```shell
-mkdir -p /home/zabbix/github
+install -d -o zabbix -g zabbix -m 0755 /home/zabbix/github
 cd /home/zabbix/github
-git clone https://github.com/Osamix2000/zabbix-dell-omsa.git
+runuser -u zabbix -- git clone https://github.com/Osamix2000/zabbix-dell-omsa.git
 ```
 
-XMLファイルをZabbix Serverへインポートする為、作業しているPCにもクローンしておくと便利です。
+既存のクローンを更新する場合は、まずローカル変更を確認します。
+
+```shell
+runuser -u zabbix -- git -C /home/zabbix/github/zabbix-dell-omsa status --short
+runuser -u zabbix -- git -C /home/zabbix/github/zabbix-dell-omsa pull --ff-only
+```
+
+履歴が分岐した場合は`pull --ff-only`が失敗します。**未コミット変更を確認せずに`git reset --hard`しないでください。** Zabbix ServerへのXMLインポートのため、作業PCへ別途ダウンロードしても構いません。
 
 ### 2. クローンしたフォルダへ移動
 
 ```shell
-cd zabbix-dell-omsa
+cd /home/zabbix/github/zabbix-dell-omsa
 ```
 
 ### 3. スクリプトとZabbix Agent設定を配置
 
-既存の`/home/zabbix/.sh/omsa.sh`がある場合は、先にバックアップしてください。
+初回の新規導入でもエラーにならないよう、既存ファイルまたはシンボリックリンクがある場合だけバックアップします。
 
 ```shell
-mkdir -p /home/zabbix/.sh
-cp -a /home/zabbix/.sh/omsa.sh /home/zabbix/.sh/omsa.sh.bak.$(date +%Y%m%d%H%M%S)
+install -d -o zabbix -g zabbix -m 0755 /home/zabbix/.sh
+BACKUP_DATE="$(date +%Y%m%d%H%M%S)"
+
+if [ -e /home/zabbix/.sh/omsa.sh ] || [ -L /home/zabbix/.sh/omsa.sh ]; then
+    cp -a /home/zabbix/.sh/omsa.sh "/home/zabbix/.sh/omsa.sh.bak."$BACKUP_DATE
+fi
+
+if [ -e /etc/zabbix/zabbix_agentd.d/omsa.conf ] || [ -L /etc/zabbix/zabbix_agentd.d/omsa.conf ]; then
+    cp -a /etc/zabbix/zabbix_agentd.d/omsa.conf "/etc/zabbix/zabbix_agentd.d/omsa.conf.bak."$BACKUP_DATE
+fi
 ```
 
-新規配置または置き換えます。
+最初から`ln -sfn`を使用します。次は**Zabbix Agent 1の設定例**です。
 
 ```shell
-ln -s /home/zabbix/github/zabbix-dell-omsa/omsa.sh /home/zabbix/.sh/omsa.sh
-ln -s /home/zabbix/github/zabbix-dell-omsa/omsa.conf /etc/zabbix/zabbix_agentd.d/omsa.conf
+runuser -u zabbix -- ln -sfn /home/zabbix/github/zabbix-dell-omsa/omsa.sh /home/zabbix/.sh/omsa.sh
+ln -sfn /home/zabbix/github/zabbix-dell-omsa/omsa.conf /etc/zabbix/zabbix_agentd.d/omsa.conf
 ```
 
-既にファイルが存在している場合は、必要に応じて`ln -sfn`で貼り直してください。
+`-s`はシンボリックリンクを作成、`-f`は既存のファイル・リンクを置き換え、`-n`はディレクトリを指すリンクを辿らない指定です。**通常ファイルも置き換わるため、バックアップを確認してください。** 宛先が実際のディレクトリであれば作業を止め、構成を確認してください。
 
-### 4. 権限を設定
+Zabbix Agent 2では`/etc/zabbix/zabbix_agent2.d`など、実際に設定ファイルで`Include`されるディレクトリに配置してください。ディレクトリが存在しないときは、まずAgentの設定を確認してください。
+
+### 4. 権限と配置を確認
+
+clone時点で`zabbix`ユーザー所有なので、ホーム全体への所有者変更は不要です。
 
 ```shell
-chown -R zabbix:zabbix /home/zabbix
-chmod 700 /home/zabbix/github/zabbix-dell-omsa/omsa.sh
+runuser -u zabbix -- chmod 700 /home/zabbix/github/zabbix-dell-omsa/omsa.sh
+ls -l /home/zabbix/.sh/omsa.sh /etc/zabbix/zabbix_agentd.d/omsa.conf
+runuser -u zabbix -- test -x /home/zabbix/.sh/omsa.sh
 ```
+
+既存のroot所有リポジトリを修正する必要がある場合だけ、対象を限定して`chown -R zabbix:zabbix /home/zabbix/github/zabbix-dell-omsa`を使用してください。`/home/zabbix`全体の`chown -R`は避けます。
 
 ### 5. Zabbixユーザーの実行権限を追加
 
-Zabbix Agentから`omsa.sh`をroot権限で実行できるようにします。<br>
-本リポジトリでは、`/etc/sudoers`本体へ直接追記するのではなく、`/etc/sudoers.d/zabbix-omsa`として分離して管理する方針です。
-
-詳細は[🔑 sudoers.d設定](#sudoers)を参照してください。
+Zabbix Agentから`omsa.sh`をroot権限で実行するため、sudoersを設定します。`/etc/sudoers`本体ではなく、`/etc/sudoers.d/zabbix-omsa`に分離します。詳細は[🔑 sudoers.d設定](#sudoers)を参照してください。
 
 ### 6. Zabbix AgentのTimeoutを確認
 
-OMSA以外の取得では、`ipmitool`や`perccli`が少し時間を使う可能性があります。<br>
-Zabbix Agent側の`Timeout`は`12`秒程度を推奨します。
+`ipmitool`や`perccli`などは取得に時間がかかる場合があるため、Agent側の`Timeout`は環境を見ながら`12`秒程度を目安にしてください。
 
-Zabbix Agentの場合です。
-
-```shell
-vim /etc/zabbix/zabbix_agentd.conf
-```
-
-```text
-Timeout=12
-```
-
-Zabbix Agent2の場合です。
-
-```shell
-vim /etc/zabbix/zabbix_agent2.conf
-```
+Agent 1なら`/etc/zabbix/zabbix_agentd.conf`、Agent 2なら`/etc/zabbix/zabbix_agent2.conf`を確認します。
 
 ```text
 Timeout=12
@@ -370,21 +376,19 @@ Timeout=12
 
 ### 7. Zabbix Agentを再起動
 
-Zabbix Agentの場合です。
+設定を変更した場合、使用中のAgentのみを再起動します。監視が一時的に途切れる可能性があります。
 
 ```shell
+# Zabbix Agent 1の場合
 systemctl restart zabbix-agent
-```
 
-Zabbix Agent2の場合です。
-
-```shell
-systemctl restart zabbix-agent2
+# Zabbix Agent 2の場合（Agent 1と両方実行しない）
+# systemctl restart zabbix-agent2
 ```
 
 ### 8. テンプレートをインポート
 
-`dell-omsa-template-ja.xml`をZabbix Serverにインポートして、対象ホストにテンプレートを割り当てます。
+`dell-omsa-template-ja.xml`をZabbix Serverへインポートし、対象ホストに適用します。その後、`zabbix_agentd -t 'omsa.model'`などで情報取得を確認してください。
 
 <a id="sudoers"></a>
 
@@ -786,14 +790,6 @@ bash tests/omsa-bmc-ipv4-compat-test.sh
 bash tests/omsa-pdisk-id-compat-test.sh
 /home/zabbix/.sh/omsa.sh --backend-status
 ```
-
-## 📝 2.0.2での主な変更
-
-- `sudoers.d/zabbix-omsa`を追加しました。
-- 従来sudo環境では、`omsa.sh`実行時のsudo成功ログとPAM sessionログを抑制できるようにしました。
-- Proxmox 9、Ubuntu 26.04等のsudo-rs環境向けに、`sudoers.d/zabbix-omsa.sudo-rs`を追加しました。
-- sudo-rs環境では、sudoersだけで`omsa.sh`のsudoログを個別抑制できない為、実行許可のみ行う方針をREADMEへ追記しました。
-- `omsa.sh`本体の監視処理には変更ありません。
 
 <a id="notes"></a>
 
