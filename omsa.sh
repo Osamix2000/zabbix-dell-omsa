@@ -5,11 +5,27 @@
 
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.0.3"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_UID="$(id -u 2>/dev/null || echo unknown)"
 
-OMSABIN="${OMSABIN:-/opt/dell/srvadmin/bin/omreport}"
+# Ubuntu 26.04等の互換環境では、OMSA専用LD_LIBRARY_PATHを付与する
+# /usr/local/sbin/omreportラッパーを優先します。
+# 明示されたOMSABINは変更せず、ラッパーが無い環境では従来パスへ戻します。
+function SelectOMSABin {
+	local WRAPPER="${1:-/usr/local/sbin/omreport}"
+	local NATIVE="${2:-/opt/dell/srvadmin/bin/omreport}"
+
+	if [ -n "${OMSABIN:-}" ]; then
+		printf '%s\n' "$OMSABIN"
+	elif [ -x "$WRAPPER" ]; then
+		printf '%s\n' "$WRAPPER"
+	else
+		printf '%s\n' "$NATIVE"
+	fi
+}
+
+OMSABIN="$(SelectOMSABin)"
 REDFISH_BASE_ENV="${REDFISH_BASE:-}"
 REDFISH_BASE="${REDFISH_BASE:-https://169.254.0.1}"
 REDFISH_CONFIG="${REDFISH_CONFIG:-/home/zabbix/.config/dell-redfish.conf}"
@@ -25,6 +41,9 @@ IPMI_SENSOR_CACHE="${IPMI_SENSOR_CACHE:-/tmp/dell_hw_monitor_ipmi_sensor_${SCRIP
 OMSA_BMC_CACHE_TTL="${OMSA_BMC_CACHE_TTL:-240}"
 OMSA_BMC_CACHE="${OMSA_BMC_CACHE:-/tmp/dell_hw_monitor_omsa_bmc_${SCRIPT_UID}.cache}"
 OMSA_BMC_CACHE_LOCK="${OMSA_BMC_CACHE_LOCK:-/tmp/dell_hw_monitor_omsa_bmc_${SCRIPT_UID}.lock}"
+# system summaryにのみ存在するiDRAC IPv4関連情報の短時間キャッシュ。
+# 全体のsystem summaryではなくRemote Access Controller節のみを保存する。
+OMSA_BMC_SUMMARY_CACHE="${OMSA_BMC_SUMMARY_CACHE:-/tmp/dell_hw_monitor_omsa_summary_${SCRIPT_UID}.cache}"
 # 温度センサーが取得不可の場合に返す値です。ZabbixのNumeric(float)向けに文字列ではなく数値を返します。
 TEMP_UNSUPPORTED_VALUE="${TEMP_UNSUPPORTED_VALUE:--273}"
 # ZabbixのunitsがBの場合、表示は1024換算になるため、既定では表示合わせで1024換算にします。
@@ -438,12 +457,14 @@ function OMSABmcOutput {
 
 function ExtractOmreportField {
 	local FIELD="$1"
-	awk -F':' -v FIELD="$FIELD" '
+	awk -v FIELD="$FIELD" '
 		$0 ~ "^[[:space:]]*" FIELD "[[:space:]]*:" {
-			$1=""
-			sub(/^:/, "", $0)
-			gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
-			print $0
+			value=$0
+			# $1=""のようなフィールド再構築は値に含まれる":"も消してしまう。
+			# 最初の「項目名:」だけを除去して、0:1:0等のID全体を維持する。
+			sub(/^[^:]*:[[:space:]]*/, "", value)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+			print value
 			exit
 		}
 	'
@@ -452,14 +473,15 @@ function ExtractOmreportField {
 
 # omreportのlist形式はバージョンやコマンドによって空白位置や単位の付け方が変わるため、
 # 固定列ではなく「項目名 : 値」を基準に解析します。11.0系/11.1系の両方を同じ処理で扱います。
+# 値の中のコロンはDell物理ディスクID (例: 0:1:0) に使うため保持する。
 function ExtractOmreportFields {
 	local FIELD="$1"
-	awk -F':' -v FIELD="$FIELD" '
+	awk -v FIELD="$FIELD" '
 		$0 ~ "^[[:space:]]*" FIELD "[[:space:]]*:" {
-			$1=""
-			sub(/^:/, "", $0)
-			gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
-			print $0
+			value=$0
+			sub(/^[^:]*:[[:space:]]*/, "", value)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+			print value
 		}
 	'
 }
@@ -505,6 +527,56 @@ function ExtractBmcIPv4Field {
 			sub(/^:/, "", $0)
 			gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
 			print $0
+			exit
+		}
+	'
+}
+
+# system summaryのRemote Access Controller節だけを取得して短時間キャッシュする。
+# 機器の通常のNIC情報をiDRAC管理IPと取り違えないために節を限定する。
+function OMSABmcSummaryOutput {
+	local OUT SECTION TMPFILE
+
+	if CacheIsFresh "$OMSA_BMC_SUMMARY_CACHE" "$OMSA_BMC_CACHE_TTL"; then
+		cat "$OMSA_BMC_SUMMARY_CACHE"
+		return 0
+	fi
+
+	OUT="$(OMSARun system summary 2>/dev/null)" || return 1
+	SECTION="$(printf '%s\n' "$OUT" | awk '
+		/^[[:space:]]*Remote Access Controller Information[[:space:]]*$/ {in_section=1; print; next}
+		in_section && /^[[:space:]]*---+[[:space:]]*$/ {exit}
+		in_section {print}
+	')"
+	[ -n "$SECTION" ] || return 1
+
+	TMPFILE="$(mktemp "${OMSA_BMC_SUMMARY_CACHE}.XXXXXXXX" 2>/dev/null)" || TMPFILE=""
+	if [ -n "$TMPFILE" ]; then
+		if printf '%s\n' "$SECTION" > "$TMPFILE"; then
+			mv -f "$TMPFILE" "$OMSA_BMC_SUMMARY_CACHE" 2>/dev/null || rm -f "$TMPFILE"
+		else
+			rm -f "$TMPFILE"
+		fi
+	fi
+	printf '%s\n' "$SECTION"
+}
+
+# system summary内の管理コントローラー節だけからIPv4アドレス類を抽出する。
+# MACやOS側Network Data節には一致させない。
+function ExtractSummaryBmcIPv4Field {
+	local FIELD="$1"
+	awk -v FIELD="$FIELD" '
+		/^[[:space:]]*Remote Access Controller Information[[:space:]]*$/ {in_section=1; next}
+		in_section && /^[[:space:]]*---+[[:space:]]*$/ {exit}
+		in_section && $0 ~ "^[[:space:]]*" FIELD "[[:space:]]*:" {
+			v=$0
+			sub(/^[^:]*:[[:space:]]*/, "", v)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+			if (v !~ /^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$/) exit
+			n=split(v, octet, ".")
+			if (n != 4) exit
+			for (i=1; i<=4; i++) if (octet[i] > 255) exit
+			print v
 			exit
 		}
 	'
@@ -1483,7 +1555,7 @@ function PowerStatus {
 
 function BmcInfo {
 	local MODE="$1"
-	local OUT VALUE
+	local OUT VALUE FIELD SUMMARY
 	OUT="$(OMSABmcOutput 2>/dev/null)" || true
 	if [ -n "$OUT" ]; then
 		case "$MODE" in
@@ -1532,6 +1604,22 @@ function BmcInfo {
 				;;
 		esac
 		[ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
+	fi
+
+	# remoteaccess / bmcがIPv4情報を返さないDell機では、
+	# system summaryのRemote Access Controller節を最後のOMSA取得元として利用する。
+	case "$MODE" in
+		ipv4) FIELD="IP Address" ;;
+		ipv4_subnet) FIELD="IP Subnet" ;;
+		ipv4_gateway) FIELD="IP Gateway" ;;
+		*) FIELD="" ;;
+	esac
+	if [ -n "$FIELD" ]; then
+		SUMMARY="$(OMSABmcSummaryOutput 2>/dev/null)" || true
+		if [ -n "$SUMMARY" ]; then
+			VALUE="$(printf '%s\n' "$SUMMARY" | ExtractSummaryBmcIPv4Field "$FIELD")"
+			[ -n "$VALUE" ] && PrintValue "OMSA" "$VALUE" && return
+		fi
 	fi
 
 	case "$MODE" in

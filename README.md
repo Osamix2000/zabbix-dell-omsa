@@ -6,7 +6,7 @@
 既存の`omsa.*`キーとの互換性を維持しつつ、OMSAが使える環境ではOMSAを最優先で使用します。<br>
 OMSAが無い環境やOMSAで取得できない項目は、`dmidecode`、`ipmitool -I open`、`perccli`、Redfish、`racadm`等で取得を試みます。
 
-更新日: 2026年7月30日(木)
+更新日: 2026年10月19日(月)
 
 ---
 
@@ -34,6 +34,7 @@ OMSAが無い環境やOMSAで取得できない項目は、`dmidecode`、`ipmito
 - [🧾 主な手動取得例](#manual-examples)
 - [⚙️ 主な環境変数](#environment-variables)
 - [🗄️ IPMIキャッシュについて](#ipmi-cache)
+- [📝 v2.0.3の主な変更](#changes-203)
 - [⚠️ 注意点](#notes)
 - [💡 Tips](#tips)
 
@@ -61,7 +62,7 @@ OMSAが無い環境やOMSAで取得できない項目は、`dmidecode`、`ipmito
 
 | 種別 | バージョン |
 |---|---|
-| スクリプト | 2.1.0 |
+| スクリプト | 2.0.3（developでリリース準備中） |
 | OMSA | 11.0.0.0 / 11.1.0.0 |
 | Zabbix | 7.0.26 |
 | perccli | 007.1020.0000.0000 |
@@ -70,7 +71,7 @@ OMSAが無い環境やOMSAで取得できない項目は、`dmidecode`、`ipmito
 
 ## 🔄 OMSA 11.0 / 11.1互換について
 
-スクリプトv2.1.0では、OMSA 11.0.0.0と11.1.0.0の両方を同一コードで扱えるように、`omreport`の解析方法を見直しています。
+スクリプトv2.0.3では、OMSA 11.0.0.0と11.1.0.0の両方を同一コードで扱えるよう、`omreport`の解析方法を共通化しています。
 
 従来は一部で`awk '{print $3}'`等の固定列を参照していましたが、OMSAのバージョンやコマンドによって空白位置や単位表記が変わると誤取得する可能性があります。
 現在は可能な限り`項目名 : 値`を基準に取得します。
@@ -82,10 +83,45 @@ OMSAが無い環境やOMSAで取得できない項目は、`dmidecode`、`ipmito
 - 消費電力: `539 W` / `539W`の両方から数値だけを返す
 - ファン、温度、PSU、RAM、電力監視のIndex解析を固定列依存から変更
 - 物理ディスク、仮想ディスクのOMSA出力解析を項目名ベースへ変更
+- OMSA物理ディスクID（`0:1:0`等）のコロンを保持し、正しい単一LLDレコードと`pdstatus`の引数へ渡す
 - BMC/iDRAC情報は新しい`remoteaccess`と従来の`bmc`を利用可能な範囲で併用
+- iDRACのIPv4アドレス/サブネット/ゲートウェイが両コマンドで取得できない場合は、`omreport system summary`の`Remote Access Controller Information`節に限って補完（OS側NIC情報は採用しない）
 
 この設計はOMSAバージョン番号で処理を分岐する方式ではありません。
 その為、11.0.0.0/11.1.0.0だけでなく、同系統の出力形式を持つ小改訂でも壊れにくい構成を目指しています。
+
+### 物理ディスクの状態がUnknown、Discoveryに重複IDが出る場合
+
+OMSAの物理ディスクIDは`0:1:0`などのコロン区切りです。過去の`omsa.sh`では、`ExtractOmreportFields "ID"`の処理でこのIDが`0`・`1`・`0`に分割される問題がありました。この状態では、正しい物理ディスク情報を問い合わせられず`Unknown`になる可能性があります。
+
+修正後は、ディスク8台なら`{#PDISK}`が`0:1:0`〜`0:1:7`の8件となり、`omsa.pdstatus[0:1:0,0,status]`が`Online`、故障予測が`No`を返す想定です。実機によってエンクロージャ番号やスロット番号は異なります。従来のperccli形式`32:0`なども引き続き維持します。
+
+```shell
+cd /home/zabbix/github/zabbix-dell-omsa
+bash tests/omsa-pdisk-id-compat-test.sh
+/home/zabbix/.sh/omsa.sh pddiscovery
+/home/zabbix/.sh/omsa.sh pdstatus '0:1:0' 0 status
+/home/zabbix/.sh/omsa.sh --source pdstatus '0:1:0' 0 status
+zabbix_agentd -t 'omsa.pdstatus[0:1:0,0,status]'
+```
+
+Zabbixの物理ディスクDiscovery間隔はテンプレート上では30分です。修正前の不正なディスクIDから作成されたアイテムは、新しいDiscoveryで見失われても即時削除されず、テンプレートの`lifetime`設定（30日）に従い残る場合があります。既存の監視履歴を残す場合は、テンプレートを解除してデータを削除せず、まず新しい8件が取得できるか確認してください。
+
+なお、OMSAが`Status : Non-Critical`、`State : Online`を同時に返すことがあります（Dell非認定ディスク等）。本テンプレートの「物理ディスクのステータス」は`State`を監視するため、`Online`であることとその他の警告がないことは同義ではありません。
+
+### iDRAC IPv4アドレスがUnsupportedになる場合
+
+OMSA 11.1.0.0を導入した一部のPowerEdge環境では、`omreport chassis remoteaccess`および`omreport chassis bmc`にIPv4アドレスが含まれない一方、`omreport system summary`の`Remote Access Controller Information`節に正しい管理IPが表示される場合があります。
+
+`omsa.sh`は従来の`remoteaccess`/`bmc`出力を優先し、IPv4アドレス・サブネット・ゲートウェイが取得できなかった項目のみ`system summary`を参照します。複数アイテムからの連続取得に備えて、この節だけをユーザー単位で既定240秒キャッシュします。IPv4アドレスのない`system summary`ではOS側NICのIPを代用しません。
+
+```shell
+omreport system summary
+/home/zabbix/.sh/omsa.sh bmc ipv4
+/home/zabbix/.sh/omsa.sh --source bmc ipv4
+zabbix_agentd -t 'omsa.bmc[ipv4]'
+bash tests/omsa-bmc-ipv4-compat-test.sh
+```
 
 ### 11.0.0.0から11.1.0.0へ更新後にファンが0rpmになる場合
 
@@ -100,8 +136,8 @@ OMSAが無い環境やOMSAで取得できない項目は、`dmidecode`、`ipmito
 OMSA生出力も確認します。
 
 ```shell
-/opt/dell/srvadmin/bin/omreport chassis fans
-/opt/dell/srvadmin/bin/omreport chassis fans index=0
+omreport chassis fans
+omreport chassis fans index=0
 ```
 
 `fanstatus 0 rpm`が実際のRPM数値を返せば、Zabbix Agent側からも確認します。
@@ -708,8 +744,11 @@ chmod 600 /home/zabbix/.config/dell-redfish.conf
 
 | 変数 | 既定値 | 用途 |
 |---|---:|---|
+| `OMSABIN` | 自動判定 | OMSA用`omreport`の明示パス（指定時は最優先） |
 | `COMMAND_TIMEOUT` | `12` | 共通の内部タイムアウト秒数 |
 | `OMSA_TIMEOUT` | `12` | OMSAコマンドの内部タイムアウト秒数 |
+| `OMSA_BMC_SUMMARY_CACHE` | `/tmp/dell_hw_monitor_omsa_summary_<UID>.cache` | iDRAC管理IPv4情報の一時キャッシュ |
+| `OMSA_BMC_CACHE_TTL` | `240` | BMC・iDRAC情報キャッシュの有効秒数 |
 | `IPMI_TIMEOUT` | `12` | ipmitoolの内部タイムアウト秒数 |
 | `PERCCLI_TIMEOUT` | `12` | perccliの内部タイムアウト秒数 |
 | `IPMI_CACHE_TTL` | `240` | IPMI sensor結果キャッシュの有効秒数 |
@@ -726,6 +765,27 @@ chmod 600 /home/zabbix/.config/dell-redfish.conf
 既定では`240`秒です。<br>
 IPMIセンサーキャッシュは、実行ユーザーごとに分離されます。<br>
 rootで手動確認したキャッシュが、Zabbix実行時に干渉しにくいようにしています。
+
+<a id="changes-203"></a>
+
+## 📝 v2.0.3での主な変更（リリース準備中）
+
+- OMSA実行パスは、明示的な`OMSABIN`設定を優先し、次に`/usr/local/sbin/omreport`の互換ラッパー、最後にDell純正パスを選択します。従来環境ではラッパー不在なら既存パスを使用します。
+- OMSA 11.1.0.0の一部環境で`chassis remoteaccess` / `chassis bmc`にiDRACのIPv4情報が含まれない場合、`system summary`のRemote Access Controller節からIPv4・サブネット・ゲートウェイを補完します。OS側NICのIPは混同しません。
+- OMSA物理ディスクID（例: `0:1:0`）のコロンが消える解析不具合を修正し、Discoveryの重複や物理ディスク状態の`Unknown`を防止します。
+- OMSA 11.0.0.0 / 11.1.0.0の両実機でOMSA認識と物理ディスクDiscoveryを確認し、代表的な状態・予測故障取得も検証しました。RAID冗長性低下の検知は、仮想ディスク監視と既存トリガーが担当します。
+- OMSA解析、実行パス、iDRAC IPv4、物理ディスクIDについての回帰テストを追加・確認しています。テストデータには文書用IPアドレスを使用し、実機の識別情報は記載しません。
+- Zabbixテンプレート、監視キー、sudoers設定の変更はありません。
+
+確認例（既存監視を停止・再起動する必要はありません）。
+
+```shell
+bash tests/omsa-parser-compat-test.sh
+bash tests/omsa-binary-selection-test.sh
+bash tests/omsa-bmc-ipv4-compat-test.sh
+bash tests/omsa-pdisk-id-compat-test.sh
+/home/zabbix/.sh/omsa.sh --backend-status
+```
 
 ## 📝 2.0.2での主な変更
 
@@ -755,10 +815,16 @@ rootで手動確認したキャッシュが、Zabbix実行時に干渉しにく�
 
 ## 💡 Tips
 
-OMSAの`omreport`パスは、既定で以下を想定しています。
+`omsa.sh`はOMSA実行ファイルを以下の順で自動選択します。
 
-```text
-/opt/dell/srvadmin/bin/omreport
+1. 環境変数`OMSABIN`の明示指定（最優先）
+2. 実行可能な`/usr/local/sbin/omreport`（Ubuntu 26.04などのOMSA互換ライブラリ用ラッパー）
+3. 従来の`/opt/dell/srvadmin/bin/omreport`（ラッパーが無い場合）
+
+互換ラッパーがない従来のCentOS 7などでは、これまでのDell純正パスを利用します。`OMSABIN`を明示設定すれば選択を上書きできます。
+
+```shell
+OMSABIN=/usr/local/sbin/omreport /home/zabbix/.sh/omsa.sh --backend-status
 ```
 
-環境によってOMSAが別ディレクトリにインストールされている場合は、スクリプト内のOMSAパス設定を変更してください。
+`/usr/local/sbin/omreport`が存在しても実行不能なら従来パスへフォールバックします。ラッパーが実行可能でも、その実行に失敗した場合は自動で別パスへ切り替わらず、既存のOMSA失敗時フォールバック処理が働きます。
