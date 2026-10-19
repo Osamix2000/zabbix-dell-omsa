@@ -62,7 +62,7 @@ OMSAが無い環境やOMSAで取得できない項目は、`dmidecode`、`ipmito
 
 | 種別 | バージョン |
 |---|---|
-| スクリプト | 2.0.3（developでリリース準備中） |
+| スクリプト | 2.0.3 |
 | OMSA | 11.0.0.0 / 11.1.0.0 |
 | Zabbix | 7.0.31 |
 | perccli | 007.1020.0000.0000 |
@@ -772,7 +772,7 @@ rootで手動確認したキャッシュが、Zabbix実行時に干渉しにく�
 
 <a id="changes-203"></a>
 
-## 📝 v2.0.3での主な変更（リリース準備中）
+## 📝 v2.0.3での主な変更
 
 - OMSA実行パスは、明示的な`OMSABIN`設定を優先し、次に`/usr/local/sbin/omreport`の互換ラッパー、最後にDell純正パスを選択します。従来環境ではラッパー不在なら既存パスを使用します。
 - OMSA 11.1.0.0の一部環境で`chassis remoteaccess` / `chassis bmc`にiDRACのIPv4情報が含まれない場合、`system summary`のRemote Access Controller節からIPv4・サブネット・ゲートウェイを補完します。OS側NICのIPは混同しません。
